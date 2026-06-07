@@ -16,6 +16,10 @@ eggs/
 .eggs/
 lib/
 lib64/
+!frontend/lib/
+frontend/lib/*
+!frontend/lib/api.ts
+!frontend/lib/types.ts
 parts/
 sdist/
 var/
@@ -106,6 +110,7 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
 .venv
 env/
 venv/
@@ -144,3 +149,7 @@ out/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+*.sql
+
+docs/*
