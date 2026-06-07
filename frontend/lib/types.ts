@@ -37,6 +37,7 @@ export type SessionResponse = {
     notable_resume_claims: string[];
   };
   interviewers: Interviewer[];
+  max_duration_seconds: number;
 };
 
 export type InterviewTurnResponse = {
@@ -183,11 +184,26 @@ export type ProgressDashboardResponse = {
   latest: ProgressAnalysis;
 };
 
+export type BenchmarkGapDimension = {
+  dimension: string;
+  your_score: number;
+  ref_range: string;
+  gap: number;
+  status: "above" | "within" | "below";
+};
+
+export type BenchmarkGapProfile = {
+  profile: string;
+  dimensions: BenchmarkGapDimension[];
+};
+
 export type ReportComparisonResponse = {
   left: InterviewReport;
   right: InterviewReport;
   score_changes: string[];
   improved_areas: string[];
   remaining_weaknesses: string[];
+  regressions: string[];
   panel_observations: string[];
+  benchmark_gaps: BenchmarkGapProfile[];
 };

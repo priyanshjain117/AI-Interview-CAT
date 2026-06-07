@@ -179,3 +179,9 @@ export function practiceAgain(practiceId: string) {
     }
   );
 }
+
+export function deleteSession(sessionId: string) {
+  return request<{ deleted: boolean; session_id: string }>(`/sessions/${sessionId}`, {
+    method: "DELETE"
+  });
+}

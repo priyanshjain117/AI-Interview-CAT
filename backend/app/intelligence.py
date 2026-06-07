@@ -704,6 +704,16 @@ class InterviewIntelligence:
         opening_topic: str,
         selected_topic: str,
     ) -> str | None:
+        # Decide whether this turn should "pick up" from the candidate's last answer
+        # ~every 3rd question should feel conversationally linked.
+        should_link = bool(latest_answer) and (memory.turn_count % 3 == 0)
+        link_instruction = (
+            "LINKING TURN: Begin your question by briefly referencing ONE specific word or phrase "
+            "the candidate just used (e.g. 'You mentioned X — drilling into that...'). "
+            "Then pivot naturally to your evaluation goal. Do NOT just paraphrase their whole answer."
+            if should_link else
+            "Do not open by repeating what the candidate said. Go directly to your question."
+        )
         system = (
             f"You are the {interviewer_id.value} interviewer in PANELIQ, an IIM-style MBA "
             "admissions panel. Ask exactly one concise spoken question. "
@@ -711,7 +721,7 @@ class InterviewIntelligence:
             "Do not explain your reasoning. Do not ask generic chatbot questions. "
             "Never quote candidate filler or raw transcript fragments. Every question must be professional "
             "and must satisfy one of: New Topic, Deeper Investigation, Contradiction Challenge, "
-            "Business Impact Analysis, Leadership Evaluation, MBA Fit Assessment."
+            f"Business Impact Analysis, Leadership Evaluation, MBA Fit Assessment. {link_instruction}"
         )
         topic_state = self._topic_state(memory, selected_topic)
         next_depth = min(topic_state.depth_level + 1, 5)
@@ -772,6 +782,10 @@ class InterviewIntelligence:
         claim = self._safe_question_anchor(self._last_claim(memory) or opening_topic or "your background")
         resume_anchor = self._anchor_for_topic(memory, topic, claim, opening_topic)
 
+        # ~every 3rd question, build a natural bridge from the candidate's last answer
+        should_link = bool(latest_answer) and (memory.turn_count % 3 == 0)
+        link_prefix = self._extract_answer_hook(latest_answer) if should_link else ""
+
         if interviewer_id == InterviewerId.academic:
             memory.interviewer_observations.append(
                 InterviewerObservation(
@@ -781,16 +795,18 @@ class InterviewIntelligence:
                 )
             )
             if topic == "academics":
-                question = (
+                body = (
                     f"On {self._safe_question_anchor(resume_anchor)}, take us to the {depth_focus} level: "
                     "which concept matters most, where is it applied, and what limitation should a manager know?"
                 )
             else:
-                question = (
+                body = (
                     f"Your resume mentions {self._safe_question_anchor(resume_anchor)}. At the {depth_focus} level, "
                     "what exactly did you build or decide, and what trade-off did that create?"
                 )
+            question = (link_prefix + body) if link_prefix else body
             return self._finalize_question(memory, question, interviewer_id, topic, latest_answer)
+
         if interviewer_id == InterviewerId.pressure:
             memory.interviewer_observations.append(
                 InterviewerObservation(
@@ -800,36 +816,38 @@ class InterviewIntelligence:
                 )
             )
             if memory.contradictions:
-                question = (
+                body = (
                     f"There is a consistency issue in your earlier answers. At the {depth_focus} level, "
                     "which version should the panel rely on, and what evidence supports it?"
                 )
             elif topic == "weaknesses":
-                question = (
+                body = (
                     "Choose one genuine weakness from a recent situation. What caused it, what corrective "
                     "action have you taken, and what evidence shows progress?"
                 )
             elif topic == "current affairs":
-                question = (
+                body = (
                     "Pick one current business or economic issue you have followed recently. What are the "
                     "stakeholder trade-offs, and what managerial judgment would you make?"
                 )
             else:
                 pressure_anchor = self._pressure_anchor(memory)
                 if not pressure_anchor:
-                    # Nothing usable — fall to a generic evidence challenge
-                    question = (
+                    body = (
                         "Walk us through one concrete project or role where you personally drove an outcome. "
                         f"At the {depth_focus} level, what exact decision did you make, and how was success measured?"
                     )
                 else:
                     anchor = self._safe_question_anchor(pressure_anchor)
-                    question = (
+                    body = (
                         f"I want to examine ownership around {anchor}. "
                         f"At the {depth_focus} level, "
                         "what exactly did you personally contribute — not the team — and what evidence shows that?"
                     )
+            question = (link_prefix + body) if link_prefix else body
             return self._finalize_question(memory, question, interviewer_id, topic, latest_answer)
+
+        # MBA interviewer
         memory.interviewer_observations.append(
             InterviewerObservation(
                 interviewer_id=interviewer_id,
@@ -838,25 +856,26 @@ class InterviewIntelligence:
             )
         )
         if topic == "MBA motivation":
-            question = (
+            body = (
                 f"At the {depth_focus} level, why is an MBA necessary now rather than learning on the job, "
                 "and what specific gap are you trying to close?"
             )
         elif topic == "career goals":
-            question = (
+            body = (
                 f"At the {depth_focus} level, connect your short-term role, target industry, and long-term goal. "
                 "What would make that path credible to this panel?"
             )
         elif topic == "leadership":
-            question = (
+            body = (
                 f"At the {depth_focus} level, describe a leadership decision where people disagreed with you. "
                 "What trade-off did you choose, and what changed afterwards?"
             )
         else:
-            question = (
+            body = (
                 f"Let us connect {claim} to management. At the {depth_focus} level, what metric or stakeholder "
                 "outcome changed, and what would you do differently now?"
             )
+        question = (link_prefix + body) if link_prefix else body
         return self._finalize_question(memory, question, interviewer_id, topic, latest_answer)
 
     def _generate_report_with_groq(self, memory: InterviewMemory) -> InterviewReport | None:
@@ -2054,6 +2073,59 @@ class InterviewIntelligence:
             return "your resume and interview answers"
         words = clean.split()
         return " ".join(words[:24]).strip().rstrip(".") or "your resume and interview answers"
+
+    def _extract_answer_hook(self, latest_answer: str) -> str:
+        """Extract a short, meaningful phrase from the candidate's last answer to use as
+        a conversational bridge at the start of the next question.
+
+        Returns a string like 'You mentioned "supply chain optimization" — ' or '' if nothing
+        usable is found.
+        """
+        if not latest_answer or self._is_candidate_filler(latest_answer):
+            return ""
+
+        clean = self._sanitize_candidate_text(latest_answer)
+        words = clean.split()
+        if len(words) < 6:
+            return ""
+
+        _STOP = {
+            "i", "me", "my", "we", "our", "the", "a", "an", "it", "its",
+            "this", "that", "is", "was", "are", "were", "be", "been",
+            "have", "had", "has", "do", "did", "and", "or", "but", "so",
+            "for", "of", "in", "on", "at", "to", "from", "with", "about",
+            "like", "just", "also", "very", "really", "quite", "um", "uh",
+            "said", "say", "think", "feel", "would", "could", "should",
+        }
+
+        # Build a list of cleaned tokens, skip the first 2 words (usually "I did/built")
+        tokens = [re.sub(r"[^a-zA-Z0-9\-]", "", w) for w in words[2:]]
+
+        # Slide a window of 2-3 words to find the best consecutive meaningful run
+        best_chunk: list[str] = []
+        current_chunk: list[str] = []
+
+        for token in tokens:
+            if len(token) >= 3 and token.lower() not in _STOP:
+                current_chunk.append(token)
+                if len(current_chunk) >= len(best_chunk):
+                    best_chunk = list(current_chunk)
+                if len(current_chunk) == 3:
+                    break  # 3 good words is enough
+            else:
+                current_chunk = []
+
+        if len(best_chunk) < 2:
+            return ""
+
+        hook_phrase = " ".join(best_chunk)
+        bridges = [
+            f"You mentioned \"{hook_phrase}\" \u2014 building on that, ",
+            f"Picking up on \"{hook_phrase}\" from your answer \u2014 ",
+            f"You brought up \"{hook_phrase}\" \u2014 let us dig into that. ",
+        ]
+        bridge = bridges[hash(hook_phrase) % len(bridges)]
+        return bridge
 
     def _role_for(self, interviewer_id: InterviewerId) -> str:
         if interviewer_id == InterviewerId.academic:

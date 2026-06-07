@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Download, Loader2, Mic, MicOff, PhoneOff, Play } from "lucide-react";
+import { Loader2, Mic, MicOff, PhoneOff, Play } from "lucide-react";
 import { CandidateCamera } from "@/components/CandidateCamera";
 import { InterviewerCard } from "@/components/InterviewerCard";
 import { SessionTimer } from "@/components/SessionTimer";
@@ -18,7 +18,7 @@ import type {
 
 type VoiceStatus = "idle" | "listening" | "processing" | "speaking";
 
-export function InterviewRoom({ session }: { session: SessionResponse }) {
+export function InterviewRoom({ session, onExit }: { session: SessionResponse; onExit?: () => void }) {
   const [activeInterviewerId, setActiveInterviewerId] = useState<InterviewerId | null>(null);
   const [subtitle, setSubtitle] = useState("");
   const [candidateDraft, setCandidateDraft] = useState("");
@@ -253,21 +253,39 @@ export function InterviewRoom({ session }: { session: SessionResponse }) {
   }
 
   return (
-    <main className="min-h-screen bg-slate-50 px-5 py-6 text-slate-950 lg:px-8">
-      <header className="mx-auto mb-6 flex max-w-7xl flex-wrap items-center justify-between gap-4">
+    <div className="min-h-screen bg-[#f8fafc] text-slate-900">
+      <header className="sticky top-0 z-20 flex h-14 items-center justify-between border-b border-slate-200 bg-white px-5">
         <div>
-          <p className="text-sm font-semibold uppercase tracking-wide text-navy-700">PANELIQ</p>
-          <h1 className="text-2xl font-semibold tracking-tight">IIM Panel Interview Room</h1>
+          <p className="text-xs font-bold tracking-[0.14em] uppercase text-navy-700">PANELIQ</p>
+          <p className="text-[11px] text-slate-400">IIM Panel Interview Room</p>
         </div>
         <div className="flex items-center gap-3">
-          <SessionTimer running={interviewStatus === "in_progress"} />
-          <div className="rounded-full bg-white px-4 py-2 text-sm font-medium text-slate-600">
-            {activeInterviewer ? `Active: ${activeInterviewer.role}` : "Panel ready"}
+          <SessionTimer
+            running={interviewStatus === "in_progress"}
+            maxSeconds={session.max_duration_seconds ?? 1500}
+            onTimeUp={() => {
+              if (interviewStatus === "in_progress" && !ending) endInterview();
+            }}
+          />
+          <div className="rounded-full border border-slate-200 bg-white px-3.5 py-1.5 text-xs font-medium text-slate-600">
+            {activeInterviewer ? `${activeInterviewer.name} · ${activeInterviewer.role}` : "Panel ready"}
           </div>
+          {onExit && (
+            <button onClick={onExit} className="btn btn-secondary text-xs px-3 py-1.5">
+              Exit
+            </button>
+          )}
         </div>
       </header>
 
-      <div className="mx-auto grid max-w-7xl gap-5 lg:grid-cols-2">
+      {/* Time progress bar */}
+      {interviewStatus === "in_progress" && (
+        <TimeProgressBar
+          maxSeconds={session.max_duration_seconds ?? 1500}
+          running={interviewStatus === "in_progress"}
+        />
+      )}
+      <div className="mx-auto grid max-w-6xl gap-5 px-5 pb-4 lg:grid-cols-2">
         {session.interviewers.map((interviewer: Interviewer) => (
           <InterviewerCard
             key={interviewer.id}
@@ -279,7 +297,7 @@ export function InterviewRoom({ session }: { session: SessionResponse }) {
         <CandidateCamera />
       </div>
 
-      <div className="mx-auto mt-5 max-w-7xl space-y-5">
+      <div className="mx-auto mt-5 max-w-6xl space-y-5 px-5 pb-8">
         <SubtitlePanel text={subtitle} status={voiceStatus} />
 
         <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-panel">
@@ -348,108 +366,96 @@ export function InterviewRoom({ session }: { session: SessionResponse }) {
         </section>
 
         {report ? (
-          <section className="rounded-lg border border-slate-200 bg-white p-6 shadow-panel">
+          <div className="card p-6 animate-fade-in">
             <div className="mb-5 flex flex-wrap items-end justify-between gap-3">
               <div>
-                <p className="text-sm font-semibold uppercase tracking-wide text-navy-700">
-                  Panel Report
-                </p>
-                <h2 className="text-2xl font-semibold">{report.verdict}</h2>
+                <p className="text-label mb-1">Panel Report</p>
+                <h2 className="text-2xl font-bold text-slate-900">{report.verdict}</h2>
               </div>
               <div className="flex items-end gap-4">
-                <a
-                  href={apiUrl(`/sessions/${session.session_id}/report.pdf`)}
-                  className="inline-flex items-center gap-2 rounded-md border border-slate-300 px-3 py-2 text-sm font-semibold text-slate-700"
-                >
-                  <Download className="h-4 w-4" />
-                  PDF
-                </a>
                 <div className="text-right">
-                  <p className="text-sm text-slate-500">Overall score</p>
-                  <p className="text-3xl font-semibold text-navy-900">{report.overall_score}/10</p>
+                  <p className="text-xs text-slate-400">Overall score</p>
+                  <p className={`text-3xl font-bold tabular-nums ${
+                    report.overall_score >= 8 ? "text-emerald-700" : report.overall_score >= 7 ? "text-navy-700" : report.overall_score >= 5.5 ? "text-amber-700" : "text-rose-700"
+                  }`}>{report.overall_score}<span className="text-lg font-normal text-slate-400">/10</span></p>
                 </div>
               </div>
             </div>
-            <p className="mb-5 leading-7 text-slate-700">
+            <p className="mb-5 leading-7 text-slate-600">
               {report.executive_summary || report.feedback_to_candidate}
             </p>
             <div className="mb-5 grid gap-4 md:grid-cols-2">
               <div>
-                <h3 className="mb-2 font-semibold">Strengths</h3>
-                <ul className="space-y-2 text-sm leading-6 text-slate-600">
+                <h3 className="mb-2 text-sm font-semibold text-slate-800">Strengths</h3>
+                <ul className="space-y-2">
                   {report.strengths.map((item) => (
-                    <li key={item}>{item}</li>
+                    <li key={item} className="flex items-start gap-2 text-sm text-slate-600">
+                      <span className="mt-1.5 h-1.5 w-1.5 flex-shrink-0 rounded-full bg-emerald-500" />{item}
+                    </li>
                   ))}
                 </ul>
               </div>
               <div>
-                <h3 className="mb-2 font-semibold">Weaknesses</h3>
-                <ul className="space-y-2 text-sm leading-6 text-slate-600">
+                <h3 className="mb-2 text-sm font-semibold text-slate-800">Weaknesses</h3>
+                <ul className="space-y-2">
                   {report.weaknesses.map((item) => (
-                    <li key={item}>{item}</li>
+                    <li key={item} className="flex items-start gap-2 text-sm text-slate-600">
+                      <span className="mt-1.5 h-1.5 w-1.5 flex-shrink-0 rounded-full bg-rose-500" />{item}
+                    </li>
                   ))}
                 </ul>
               </div>
             </div>
             <div className="grid gap-4 md:grid-cols-2">
               {report.dimensions.map((dimension) => (
-                <div key={dimension.name} className="rounded-md border border-slate-200 p-4">
-                  <div className="mb-2 flex items-center justify-between gap-3">
-                    <h3 className="font-semibold">{dimension.name}</h3>
-                    <span className="font-semibold text-navy-900">{dimension.score ?? "N/A"}</span>
+                <div key={dimension.name} className="rounded-xl border border-slate-200 p-4">
+                  <div className="mb-1.5 flex items-center justify-between gap-3">
+                    <h3 className="text-sm font-semibold text-slate-800">{dimension.name}</h3>
+                    <span className={`text-sm font-bold ${
+                      dimension.score !== null && dimension.score >= 8 ? "text-emerald-700" : dimension.score !== null && dimension.score >= 7 ? "text-navy-700" : dimension.score !== null && dimension.score >= 5.5 ? "text-amber-700" : "text-slate-400"
+                    }`}>{dimension.score ?? "N/A"}</span>
                   </div>
-                  <p className="text-sm leading-6 text-slate-600">{dimension.advice}</p>
+                  <p className="text-sm leading-6 text-slate-500">{dimension.advice}</p>
                 </div>
               ))}
             </div>
-            <div className="mt-5 grid gap-4 md:grid-cols-2">
-              <div>
-                <h3 className="mb-2 font-semibold">Transcript Evidence</h3>
-                <ul className="space-y-2 text-sm leading-6 text-slate-600">
-                  {report.transcript_evidence.map((item) => (
-                    <li key={`${item.topic}-${item.evidence}`}>
-                      <span className="font-medium text-slate-800">{item.topic}: </span>
-                      {item.evidence}
-                    </li>
-                  ))}
-                </ul>
+            {onExit && (
+              <div className="mt-6 flex gap-3">
+                <button onClick={onExit} className="btn btn-primary">
+                  Return to Dashboard
+                </button>
               </div>
-              <div>
-                <h3 className="mb-2 font-semibold">Recommended Improvements</h3>
-                <ul className="space-y-2 text-sm leading-6 text-slate-600">
-                  {report.recommended_improvements.map((item) => (
-                    <li key={item}>{item}</li>
-                  ))}
-                </ul>
-              </div>
-            </div>
-            <div className="mt-5">
-              <h3 className="mb-2 font-semibold">Panel Comments</h3>
-              <ul className="space-y-2 text-sm leading-6 text-slate-600">
-                {report.panel_comments.map((item) => (
-                  <li key={item}>{item}</li>
-                ))}
-              </ul>
-            </div>
-            <div className="mt-5">
-              <h3 className="mb-2 font-semibold">IIM Preparedness Benchmarks</h3>
-              <p className="mb-3 text-sm leading-6 text-slate-500">{report.benchmark_disclaimer}</p>
-              <div className="grid gap-3 md:grid-cols-3">
-                {report.benchmarking.map((item) => (
-                  <div key={item.category} className="rounded-md border border-slate-200 p-4 text-sm leading-6 text-slate-600">
-                    <h4 className="mb-2 font-semibold text-slate-900">{item.category}</h4>
-                    <p>Communication: {item.communication}</p>
-                    <p>Leadership: {item.leadership}</p>
-                    <p>Business awareness: {item.business_awareness}</p>
-                    <p>Academic depth: {item.academic_depth}</p>
-                    <p>MBA fit: {item.mba_fit}</p>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </section>
+            )}
+          </div>
         ) : null}
       </div>
-    </main>
+    </div>
+  );
+}
+
+/* ─── Time Progress Bar ──────────────────────────────────────────── */
+function TimeProgressBar({ maxSeconds, running }: { maxSeconds: number; running: boolean }) {
+  const [elapsed, setElapsed] = useState(0);
+
+  useEffect(() => {
+    if (!running) return;
+    const id = setInterval(() => setElapsed((e) => e + 1), 1000);
+    return () => clearInterval(id);
+  }, [running]);
+
+  const pct = Math.min(100, (elapsed / maxSeconds) * 100);
+  const remaining = maxSeconds - elapsed;
+
+  let barColor = "bg-emerald-500";
+  if (remaining <= 60)  barColor = "bg-red-500 time-warning";
+  else if (remaining <= 300) barColor = "bg-amber-400";
+
+  return (
+    <div className="h-1 w-full bg-slate-100" title={`${Math.round(remaining / 60)} min remaining`}>
+      <div
+        className={`h-full transition-all duration-1000 ease-linear ${barColor}`}
+        style={{ width: `${pct}%` }}
+      />
+    </div>
   );
 }

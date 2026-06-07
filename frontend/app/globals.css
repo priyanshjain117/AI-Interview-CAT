@@ -1,40 +1,161 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 :root {
   color-scheme: light;
-  background: #f8fafc;
-  color: #0f172a;
+  --color-bg: #f8fafc;
+  --color-surface: #ffffff;
+  --color-border: #e2e8f0;
+  --color-ink: #0f172a;
+  --color-ink-muted: #64748b;
+  --color-ink-faint: #94a3b8;
+  --color-accent: #1e3d75;
+  --color-accent-light: #f0f4fb;
+  background: var(--color-bg);
+  color: var(--color-ink);
 }
 
 * {
   box-sizing: border-box;
 }
 
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
 body {
   margin: 0;
   min-height: 100vh;
-  background: #f8fafc;
+  background: var(--color-bg);
   font-family:
-    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
     sans-serif;
+  font-feature-settings: "cv11", "ss01";
+  letter-spacing: -0.011em;
+  line-height: 1.6;
 }
 
 button,
 input,
-textarea {
+textarea,
+select {
   font: inherit;
 }
 
+/* ─── Focus styles ─────────────────────────────────────────────── */
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+button:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+/* ─── Scrollbar ────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+/* ─── Typography helpers ───────────────────────────────────────── */
+.text-label {
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-ink-muted);
+}
+
+/* ─── Card ─────────────────────────────────────────────────────── */
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  box-shadow: 0 1px 3px rgba(15,23,42,0.05), 0 4px 16px rgba(15,23,42,0.05);
+}
+
+/* ─── Button primitives ────────────────────────────────────────── */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  border-radius: 7px;
+  padding: 0.5rem 0.875rem;
+  transition: background 150ms ease, border-color 150ms ease, box-shadow 150ms ease, opacity 150ms ease;
+  cursor: pointer;
+  border: none;
+  white-space: nowrap;
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: var(--color-accent);
+  color: #fff;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: #162c58;
+}
+
+.btn-secondary {
+  background: #fff;
+  border: 1px solid var(--color-border);
+  color: var(--color-ink);
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: #f8fafc;
+  border-color: #94a3b8;
+}
+
+.btn-danger {
+  background: #fff;
+  border: 1px solid #fecaca;
+  color: #b91c1c;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: #fff1f2;
+}
+
+/* ─── Verdict badge colours ────────────────────────────────────── */
+.verdict-strong { background:#d1fae5; color:#065f46; }
+.verdict-good   { background:#dbeafe; color:#1e3a8a; }
+.verdict-mid    { background:#fef3c7; color:#92400e; }
+.verdict-weak   { background:#fee2e2; color:#991b1b; }
+
+/* ─── Progress bar ─────────────────────────────────────────────── */
+.progress-bar-track {
+  height: 6px;
+  border-radius: 99px;
+  background: #e2e8f0;
+  overflow: hidden;
+}
+.progress-bar-fill {
+  height: 100%;
+  border-radius: 99px;
+  background: var(--color-accent);
+  transition: width 0.6s ease;
+}
+
+/* ─── Interview room animations ────────────────────────────────── */
 @keyframes pulse-border {
-  0%,
-  100% {
-    box-shadow: 0 0 0 0 rgba(24, 52, 95, 0.2);
-  }
-  50% {
-    box-shadow: 0 0 0 8px rgba(24, 52, 95, 0);
-  }
+  0%, 100% { box-shadow: 0 0 0 0 rgba(30, 61, 117, 0.2); }
+  50% { box-shadow: 0 0 0 8px rgba(30, 61, 117, 0); }
 }
 
 .speaking-panel {
@@ -46,24 +167,109 @@ textarea {
   transform-origin: bottom;
 }
 
-.wave-bar:nth-child(2) {
-  animation-delay: 0.12s;
-}
-
-.wave-bar:nth-child(3) {
-  animation-delay: 0.24s;
-}
-
-.wave-bar:nth-child(4) {
-  animation-delay: 0.36s;
-}
+.wave-bar:nth-child(2) { animation-delay: 0.12s; }
+.wave-bar:nth-child(3) { animation-delay: 0.24s; }
+.wave-bar:nth-child(4) { animation-delay: 0.36s; }
 
 @keyframes wave {
-  0%,
-  100% {
-    transform: scaleY(0.35);
-  }
-  50% {
-    transform: scaleY(1);
-  }
+  0%, 100% { transform: scaleY(0.35); }
+  50% { transform: scaleY(1); }
 }
+
+/* ─── Utility animation classes ────────────────────────────────── */
+.animate-fade-in { animation: fadeIn 0.35s ease-out both; }
+.animate-slide-up { animation: slideUp 0.35s ease-out both; }
+
+@keyframes fadeIn {
+  0%   { opacity: 0; }
+  100% { opacity: 1; }
+}
+
+@keyframes slideUp {
+  0%   { opacity: 0; transform: translateY(12px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+/* ─── Stagger helpers for list items ───────────────────────────── */
+.stagger > *:nth-child(1) { animation-delay: 0ms; }
+.stagger > *:nth-child(2) { animation-delay: 60ms; }
+.stagger > *:nth-child(3) { animation-delay: 120ms; }
+.stagger > *:nth-child(4) { animation-delay: 180ms; }
+.stagger > *:nth-child(5) { animation-delay: 240ms; }
+.stagger > *:nth-child(6) { animation-delay: 300ms; }
+
+/* ─── Richer interviewer avatar animations ─────────────────────── */
+
+/* Speaking badge pulse */
+@keyframes badge-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.8; transform: scale(0.96); }
+}
+.speaking-badge {
+  animation: badge-pulse 1.4s ease-in-out infinite;
+}
+
+/* Avatar ripple ring when speaking */
+@keyframes avatar-ripple {
+  0%   { box-shadow: 0 0 0 0px rgba(30, 61, 117, 0.5); }
+  70%  { box-shadow: 0 0 0 10px rgba(30, 61, 117, 0); }
+  100% { box-shadow: 0 0 0 0px rgba(30, 61, 117, 0); }
+}
+.avatar-speaking {
+  animation: avatar-ripple 1.2s ease-out infinite;
+}
+
+/* Idle avatar subtle breathe */
+@keyframes avatar-idle {
+  0%, 100% { opacity: 0.75; }
+  50%       { opacity: 1; }
+}
+.avatar-idle {
+  animation: avatar-idle 3s ease-in-out infinite;
+}
+
+/* Equalizer bars — 5 bars each with offset delays */
+.eq-bar {
+  animation: eq-wave 0.7s ease-in-out infinite;
+  transform-origin: bottom;
+}
+.eq-bar:nth-child(1) { animation-delay: 0s;    animation-duration: 0.65s; }
+.eq-bar:nth-child(2) { animation-delay: 0.10s; animation-duration: 0.8s;  }
+.eq-bar:nth-child(3) { animation-delay: 0.20s; animation-duration: 0.6s;  }
+.eq-bar:nth-child(4) { animation-delay: 0.15s; animation-duration: 0.75s; }
+.eq-bar:nth-child(5) { animation-delay: 0.05s; animation-duration: 0.9s;  }
+
+@keyframes eq-wave {
+  0%, 100% { transform: scaleY(0.2); }
+  50%       { transform: scaleY(1);   }
+}
+
+/* Thinking dots for awaiting panelists */
+.thinking-dot {
+  animation: dot-fade 1.5s ease-in-out infinite;
+  border-radius: 9999px;
+}
+.thinking-dot:nth-child(1) { animation-delay: 0s; }
+.thinking-dot:nth-child(2) { animation-delay: 0.3s; }
+.thinking-dot:nth-child(3) { animation-delay: 0.6s; }
+
+@keyframes dot-fade {
+  0%, 80%, 100% { transform: scale(0.7); opacity: 0.3; }
+  40%            { transform: scale(1);   opacity: 1; }
+}
+
+/* Card active glow border */
+@keyframes glow-border {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(30, 61, 117, 0.15), 0 1px 3px rgba(15,23,42,0.06); }
+  50%       { box-shadow: 0 0 0 4px rgba(30, 61, 117, 0.12), 0 1px 3px rgba(15,23,42,0.06); }
+}
+.panel-active {
+  animation: glow-border 2s ease-in-out infinite;
+}
+
+/* Interview time-bar urgency pulse */
+@keyframes time-warning-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.6; }
+}
+.time-warning { animation: time-warning-pulse 0.9s ease-in-out infinite; }
