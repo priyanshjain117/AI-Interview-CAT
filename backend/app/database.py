@@ -414,6 +414,23 @@ class SupabaseRepository:
             )
         return items
 
+    def delete_incomplete_session(self, user_id: str, session_id: str) -> bool:
+        """Delete a session only if it is NOT completed (i.e., abandoned / stuck in created/in_progress)."""
+        client = self.require()
+        # Safety check: only allow deletion of non-completed sessions.
+        check = (
+            client.table("interview_sessions")
+            .select("id,status")
+            .eq("id", session_id)
+            .eq("user_id", user_id)
+            .neq("status", "completed")
+            .execute()
+        )
+        if not check.data:
+            return False
+        client.table("interview_sessions").delete().eq("id", session_id).eq("user_id", user_id).execute()
+        return True
+
     def progress_dashboard(self, user_id: str) -> ProgressDashboardResponse:
         response = (
             self.require()
@@ -589,17 +606,27 @@ class SupabaseRepository:
     def _save_progress_snapshot(
         self, user_id: str, report_id: str, report: InterviewReport, progress: ProgressAnalysis
     ) -> None:
-        scores = {item.name.lower(): item.score for item in report.dimensions}
+        # Normalise all dimension names to lowercase for robust key matching.
+        scores = {item.name.lower().strip(): item.score for item in report.dimensions}
+
+        def _score(*candidates: str) -> float | None:
+            """Return the first matching dimension score from multiple candidate keys."""
+            for key in candidates:
+                value = scores.get(key)
+                if value is not None:
+                    return value
+            return None
+
         self.require().table("progress_snapshots").insert(
             {
                 "user_id": user_id,
                 "report_id": report_id,
-                "communication": scores.get("communication clarity"),
-                "leadership": scores.get("leadership potential"),
-                "business_awareness": scores.get("business awareness"),
-                "mba_fit": scores.get("career clarity"),
-                "career_clarity": scores.get("career clarity"),
-                "academic_depth": scores.get("academic depth"),
+                "communication": _score("communication clarity", "communication"),
+                "leadership": _score("leadership potential", "leadership"),
+                "business_awareness": _score("business awareness"),
+                "mba_fit": _score("mba fit", "mba readiness"),
+                "career_clarity": _score("career clarity"),
+                "academic_depth": _score("academic depth"),
                 "improved_areas": progress.improved_areas,
                 "declining_areas": progress.declining_areas,
                 "recurring_weaknesses": progress.recurring_weaknesses,

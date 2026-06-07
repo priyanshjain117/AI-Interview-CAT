@@ -17,6 +17,8 @@ from app.database import SupabaseRepository
 from app.interviewers import INTERVIEWERS
 from app.models import (
     AuthenticatedUser,
+    BenchmarkGapDimension,
+    BenchmarkGapProfile,
     CandidateTurnRequest,
     CreateSessionRequest,
     EndSessionResponse,
@@ -232,6 +234,17 @@ def end_session(
         )
     except KeyError:
         raise HTTPException(status_code=404, detail="Session not found") from None
+
+
+@app.delete("/sessions/{session_id}")
+def delete_session(
+    session_id: str,
+    user: AuthenticatedUser = Depends(current_user),
+) -> dict:
+    deleted = repository.delete_incomplete_session(user.id, session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Session not found or already completed")
+    return {"deleted": True, "session_id": session_id}
 
 
 @app.get("/history", response_model=list[InterviewHistoryItem])

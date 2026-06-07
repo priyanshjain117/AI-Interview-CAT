@@ -151,6 +151,7 @@ class SessionResponse(BaseModel):
     status: InterviewStatus
     candidate: CandidateProfile
     interviewers: list[InterviewerState]
+    max_duration_seconds: int = 1500  # 25 minutes default
 
 
 class CandidateTurnRequest(BaseModel):
@@ -325,13 +326,28 @@ class ProgressDashboardResponse(BaseModel):
     latest: ProgressAnalysis
 
 
+class BenchmarkGapDimension(BaseModel):
+    dimension: str
+    your_score: float
+    ref_range: str
+    gap: float
+    status: Literal["above", "within", "below"]
+
+
+class BenchmarkGapProfile(BaseModel):
+    profile: str
+    dimensions: list[BenchmarkGapDimension]
+
+
 class ReportComparisonResponse(BaseModel):
     left: InterviewReport
     right: InterviewReport
     score_changes: list[str]
     improved_areas: list[str]
     remaining_weaknesses: list[str]
+    regressions: list[str] = Field(default_factory=list)
     panel_observations: list[str]
+    benchmark_gaps: list[BenchmarkGapProfile] = Field(default_factory=list)
 
 
 class PracticeAgainResponse(BaseModel):

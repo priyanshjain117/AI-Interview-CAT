@@ -241,6 +241,14 @@ class InterviewIntelligence:
 
     def select_speaker(self, memory: InterviewMemory) -> SpeakerSelection:
         self._ensure_topic_states(memory)
+
+        # ── Hard balance rule: force any silent panelist in by turn 3 ──
+        forced = self._force_silent_panelist(memory)
+        if forced:
+            forced.topic = self._viable_selected_topic(memory, forced.topic)
+            memory.last_speaker_reason = forced.reason
+            return forced
+
         if self.client:
             selection = self._select_speaker_with_groq(memory)
             if selection:
@@ -580,15 +588,25 @@ class InterviewIntelligence:
             )
 
     def _select_speaker_with_groq(self, memory: InterviewMemory) -> SpeakerSelection | None:
+        counts = Counter(str(item.value) for item in memory.speaker_history)
+        # Build a note about who is underrepresented
+        silent = [p for p in ["academic", "pressure", "mba"] if counts.get(p, 0) == 0]
+        balance_hint = (
+            f"IMPORTANT: The following panelists have not yet spoken: {silent}. "
+            "You MUST give one of them the next turn before continuing with others."
+            if silent else
+            "All three panelists have spoken. Continue based on memory signals."
+        )
         system = (
             "You select the next speaker in an IIM admissions panel. Return only JSON. "
-            "Do not use round-robin. Prefer the interviewer best suited to unresolved memory."
+            "Do not use round-robin, but ensure all three panelists get meaningful turns. "
+            f"{balance_hint}"
         )
         user = json.dumps(
             {
                 "candidate_profile": self._profile_payload(memory.candidate),
                 "memory": self._memory_payload(memory),
-                "speaker_counts": Counter(str(item.value) for item in memory.speaker_history),
+                "speaker_counts": counts,
                 "required_shape": {
                     "speaker": "academic|pressure|mba",
                     "reason": "selection reason",
@@ -621,13 +639,22 @@ class InterviewIntelligence:
                     topic=opportunity.topic,
                 )
 
+        # Rotate across panelists: pick the one with fewest turns from the open topics
         open_topics = self._open_topics(memory)
         if open_topics:
-            topic = open_topics[0]
+            counts = Counter(memory.speaker_history)
+            # Score each open topic by (speaker_turn_count, topic_index)
+            best_topic = min(
+                open_topics,
+                key=lambda t: (
+                    counts[TOPIC_TO_INTERVIEWER.get(t, InterviewerId.mba)],
+                    open_topics.index(t),
+                ),
+            )
             return SpeakerSelection(
-                speaker=TOPIC_TO_INTERVIEWER.get(topic, InterviewerId.mba),
-                reason=f"{topic} is under-tested for balanced IIM-style coverage.",
-                topic=topic,
+                speaker=TOPIC_TO_INTERVIEWER.get(best_topic, InterviewerId.mba),
+                reason=f"{best_topic} is under-tested; selecting the panelist with the fewest turns.",
+                topic=best_topic,
             )
 
         reopenable = self._least_tested_reopenable_topic(memory)
@@ -646,6 +673,27 @@ class InterviewIntelligence:
             reason="Balance the panel after resolving the available memory signals.",
             topic="panel balance",
         )
+
+    def _force_silent_panelist(self, memory: InterviewMemory) -> SpeakerSelection | None:
+        """After turn 2, force any panelist who has never spoken to take the next turn."""
+        if memory.turn_count < 2:
+            return None
+        counts = Counter(memory.speaker_history)
+        # Priority order: MBA first (most often starved), then pressure
+        for candidate in [InterviewerId.mba, InterviewerId.pressure, InterviewerId.academic]:
+            if counts[candidate] == 0:
+                topic_map = {
+                    InterviewerId.mba: "MBA motivation",
+                    InterviewerId.pressure: "strengths",
+                    InterviewerId.academic: "academics",
+                }
+                topic = topic_map[candidate]
+                return SpeakerSelection(
+                    speaker=candidate,
+                    reason=f"{candidate.value} panelist has not spoken yet — panel balance requires their turn.",
+                    topic=topic,
+                )
+        return None
 
     def _generate_question_with_groq(
         self,
@@ -767,10 +815,20 @@ class InterviewIntelligence:
                     "stakeholder trade-offs, and what managerial judgment would you make?"
                 )
             else:
-                question = (
-                    f"I want to test the ownership behind {claim}. At the {depth_focus} level, "
-                    "what evidence shows this was your contribution and not just a team outcome?"
-                )
+                pressure_anchor = self._pressure_anchor(memory)
+                if not pressure_anchor:
+                    # Nothing usable — fall to a generic evidence challenge
+                    question = (
+                        "Walk us through one concrete project or role where you personally drove an outcome. "
+                        f"At the {depth_focus} level, what exact decision did you make, and how was success measured?"
+                    )
+                else:
+                    anchor = self._safe_question_anchor(pressure_anchor)
+                    question = (
+                        f"I want to examine ownership around {anchor}. "
+                        f"At the {depth_focus} level, "
+                        "what exactly did you personally contribute — not the team — and what evidence shows that?"
+                    )
             return self._finalize_question(memory, question, interviewer_id, topic, latest_answer)
         memory.interviewer_observations.append(
             InterviewerObservation(
@@ -1080,33 +1138,69 @@ class InterviewIntelligence:
             next_focus_areas=(recurring or latest.weaknesses or latest.recommended_improvements)[:5],
         )
 
-    def compare_reports(self, left: InterviewReport, right: InterviewReport) -> dict[str, list[str]]:
+    def compare_reports(self, left: InterviewReport, right: InterviewReport) -> dict:
         left_scores = self._dimension_score_map(left)
         right_scores = self._dimension_score_map(right)
-        changes = [f"Overall score changed by {right.overall_score - left.overall_score:+.1f} points."]
+        delta_overall = right.overall_score - left.overall_score
+
+        changes = [f"Overall score changed by {delta_overall:+.1f} points ({left.overall_score:.1f} → {right.overall_score:.1f})."]
         improved = []
         remaining = []
         observations = []
+        regressions = []
+
         for name, right_score in right_scores.items():
             left_score = left_scores.get(name)
             if right_score is None or left_score is None:
                 continue
             delta = right_score - left_score
             if abs(delta) >= 0.3:
-                changes.append(f"{name}: {left_score:.1f} to {right_score:.1f} ({delta:+.1f}).")
+                changes.append(f"{name}: {left_score:.1f} → {right_score:.1f} ({delta:+.1f}).")
             if delta >= 0.5:
                 improved.append(name)
+            elif delta <= -0.5:
+                regressions.append(f"{name} dropped by {abs(delta):.1f} points.")
+
         left_weak = {self._normalize_for_compare(item) for item in left.weaknesses}
         for weakness in right.weaknesses:
             if self._normalize_for_compare(weakness) in left_weak:
                 remaining.append(weakness)
+
         observations.extend(right.panel_comments[:4])
         observations.extend(right.panel_concerns[:3])
+
+        # ── IIM Benchmark Gap Analysis ──────────────────────────────────────────
+        IIM_REFS: dict[str, dict[str, tuple[float, float]]] = {
+            "Average CAT Aspirant":         {"Communication clarity": (5.0, 6.2), "Leadership potential": (4.8, 6.0), "Business awareness": (4.5, 5.8), "Academic depth": (5.2, 6.5), "Career clarity": (4.8, 6.0)},
+            "Typical IIM Convert Candidate": {"Communication clarity": (6.5, 7.5), "Leadership potential": (6.2, 7.2), "Business awareness": (6.0, 7.2), "Academic depth": (6.5, 7.8), "Career clarity": (6.5, 7.5)},
+            "Strong IIM ABC Candidate":      {"Communication clarity": (7.8, 9.0), "Leadership potential": (7.5, 9.0), "Business awareness": (7.5, 8.8), "Academic depth": (7.8, 9.0), "Career clarity": (7.8, 9.2)},
+        }
+
+        benchmark_gaps: list[dict] = []
+        for profile_label, refs in IIM_REFS.items():
+            dims = []
+            for dim_name, (ref_lo, ref_hi) in refs.items():
+                user_score = right_scores.get(dim_name)
+                if user_score is None:
+                    continue
+                ref_mid = (ref_lo + ref_hi) / 2
+                gap = round(user_score - ref_mid, 1)
+                dims.append({
+                    "dimension": dim_name,
+                    "your_score": round(user_score, 1),
+                    "ref_range": f"{ref_lo}–{ref_hi}",
+                    "gap": gap,
+                    "status": "above" if gap > 0.3 else "below" if gap < -0.3 else "within",
+                })
+            benchmark_gaps.append({"profile": profile_label, "dimensions": dims})
+
         return {
-            "score_changes": changes[:8],
-            "improved_areas": improved[:8],
+            "score_changes":       changes[:8],
+            "improved_areas":      improved[:8],
             "remaining_weaknesses": remaining[:8],
-            "panel_observations": self._dedupe(observations)[:8],
+            "regressions":         regressions[:6],
+            "panel_observations":  self._dedupe(observations)[:8],
+            "benchmark_gaps":      benchmark_gaps,
         }
 
     def _build_transcript_evidence(
@@ -1191,48 +1285,58 @@ class InterviewIntelligence:
     def _benchmarking(
         self, overall: float, dimensions: list[DimensionScore]
     ) -> list[BenchmarkCategory]:
+        # Fixed reference score bands per profile — these represent interview preparedness
+        # of candidates in that cohort, NOT derived from the user's score.
+        # The frontend uses these alongside user dimension scores for gap analysis.
+        PROFILES: dict[str, dict[str, str]] = {
+            "Average CAT Aspirant": {
+                "Communication clarity":  "5.0–6.2",
+                "Leadership potential":   "4.8–6.0",
+                "Business awareness":     "4.5–5.8",
+                "Academic depth":         "5.2–6.5",
+                "Career clarity":         "4.8–6.0",
+                "notes": "Typical first-attempt CAT aspirant with limited structured preparation.",
+            },
+            "Typical IIM Convert Candidate": {
+                "Communication clarity":  "6.5–7.5",
+                "Leadership potential":   "6.2–7.2",
+                "Business awareness":     "6.0–7.2",
+                "Academic depth":         "6.5–7.8",
+                "Career clarity":         "6.5–7.5",
+                "notes": "A candidate who typically converts an IIM call through structured, evidence-backed answers.",
+            },
+            "Strong IIM ABC Candidate": {
+                "Communication clarity":  "7.8–9.0",
+                "Leadership potential":   "7.5–9.0",
+                "Business awareness":     "7.5–8.8",
+                "Academic depth":         "7.8–9.0",
+                "Career clarity":         "7.8–9.2",
+                "notes": "Top-tier IIM interview performance with concise evidence, structured leadership stories, and sharp business linkage.",
+            },
+        }
+
         scores = {item.name: item.score for item in dimensions}
+        comm  = scores.get("Communication clarity")
+        lead  = scores.get("Leadership potential")
+        biz   = scores.get("Business awareness")
+        acad  = scores.get("Academic depth")
+        # Career clarity is the closest dimension to MBA fit; fall back to overall if absent.
+        career = scores.get("Career clarity") or scores.get("Career Clarity")
 
-        def band(score: float | None, offset: int = 0) -> str:
-            if score is None:
-                return "Insufficient evidence"
-            midpoint = max(25, min(95, int(score * 10) + offset))
-            return f"{max(1, midpoint - 8)}-{min(99, midpoint + 8)} percentile"
-
-        communication = scores.get("Communication clarity")
-        leadership = scores.get("Leadership potential")
-        business = scores.get("Business awareness")
-        academic = scores.get("Academic depth")
-        mba_fit = scores.get("Career clarity")
-        return [
-            BenchmarkCategory(
-                category="Typical IIM Convert Candidate",
-                communication=band(communication),
-                leadership=band(leadership),
-                business_awareness=band(business),
-                academic_depth=band(academic),
-                mba_fit=band(mba_fit),
-                notes="Preparedness comparison against generally successful interview behavior.",
-            ),
-            BenchmarkCategory(
-                category="Strong IIM ABC Candidate",
-                communication=band(communication, -10),
-                leadership=band(leadership, -12),
-                business_awareness=band(business, -12),
-                academic_depth=band(academic, -10),
-                mba_fit=band(mba_fit, -12),
-                notes="A stricter benchmark for highly polished interview readiness.",
-            ),
-            BenchmarkCategory(
-                category="Average CAT Aspirant",
-                communication=band(communication, 10),
-                leadership=band(leadership, 8),
-                business_awareness=band(business, 8),
-                academic_depth=band(academic, 8),
-                mba_fit=band(mba_fit, 8),
-                notes="Comparison to typical preparation quality, not selection likelihood.",
-            ),
-        ]
+        results: list[BenchmarkCategory] = []
+        for label, ref in PROFILES.items():
+            results.append(
+                BenchmarkCategory(
+                    category=label,  # type: ignore[arg-type]
+                    communication=ref["Communication clarity"],
+                    leadership=ref["Leadership potential"],
+                    business_awareness=ref["Business awareness"],
+                    academic_depth=ref["Academic depth"],
+                    mba_fit=ref["Career clarity"],
+                    notes=ref["notes"],
+                )
+            )
+        return results
 
     def _generate_coaching_with_groq(
         self, weaknesses: list[str], evidence: list[TranscriptEvidence]
@@ -1605,6 +1709,51 @@ class InterviewIntelligence:
                 return claim
         return ""
 
+    def _pressure_anchor(self, memory: InterviewMemory) -> str:
+        """Return the best ownership anchor for the pressure interviewer.
+
+        Priority order:
+        1. Recent interview-time claims that contain an action verb (candidate's own words)
+        2. Resume-seeded claims that contain an action verb
+        3. Profile projects or internship items
+        4. Any non-bad claim from candidate_claims
+        """
+        action_verbs = [
+            "led", "built", "created", "designed", "developed", "managed",
+            "achieved", "improved", "launched", "delivered", "owned",
+            "drove", "trained", "analyzed", "solved", "reduced", "increased",
+            "won", "ranked", "secured", "published", "deployed",
+        ]
+
+        def has_action(text: str) -> bool:
+            lower = text.lower()
+            return any(v in lower for v in action_verbs)
+
+        # 1. Interview-time claims with action verbs (most credible)
+        for claim in reversed(memory.candidate_claims):
+            if claim.source == "interview" and not self._is_bad_anchor(claim.text) and has_action(claim.text):
+                return claim.text
+
+        # 2. Resume-seeded claims with action verbs
+        for claim in reversed(memory.candidate_claims):
+            if not self._is_bad_anchor(claim.text) and has_action(claim.text):
+                return claim.text
+
+        # 3. Profile projects / internships — concrete and always actionable
+        for item in memory.candidate.projects:
+            if item and not self._is_bad_anchor(item):
+                return item
+        for item in memory.candidate.internships:
+            if item and not self._is_bad_anchor(item):
+                return item
+
+        # 4. Any acceptable claim
+        for claim in reversed(memory.candidate_claims):
+            if not self._is_bad_anchor(claim.text):
+                return claim.text
+
+        return ""
+
     def _topic_from_reason(self, reason: str) -> str:
         lower = reason.lower()
         for topic in [
@@ -1810,8 +1959,30 @@ class InterviewIntelligence:
             "what to answer",
             "umm",
             "uhh",
+            # Skill/importance lines that make no sense as ownership anchors
+            "importance of ",
+            "use of python",
+            "role of python",
+            "introduction to ",
+            "applications of ",
+            "fundamentals of ",
+            "coursework",
+            "syllabus",
         ]
-        return any(fragment in lower for fragment in bad_fragments)
+        if any(fragment in lower for fragment in bad_fragments):
+            return True
+        # Reject lines with no action verb — pure noun phrases from skills sections
+        action_verbs = [
+            "led", "built", "created", "designed", "developed", "managed",
+            "achieved", "improved", "launched", "delivered", "owned",
+            "drove", "trained", "analyzed", "solved", "reduced", "increased",
+            "won", "ranked", "secured", "published", "deployed",
+        ]
+        words = lower.split()
+        # Short lines (< 5 words) with no action verb are likely skill labels, not anchors
+        if len(words) < 5 and not any(v in lower for v in action_verbs):
+            return True
+        return False
 
     def _sanitize_candidate_text(self, value: str) -> str:
         clean = re.sub(r"\s+", " ", str(value or "")).strip()

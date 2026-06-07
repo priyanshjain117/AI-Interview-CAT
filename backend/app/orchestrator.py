@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 from app.database import SupabaseRepository
@@ -19,6 +19,9 @@ from app.models import (
     TurnSpeaker,
 )
 from app.voice import VoiceService
+
+
+MAX_DURATION_SECONDS = 1500  # 25-minute interview wall-clock limit
 
 
 class InterviewOrchestrator:
@@ -72,6 +75,7 @@ class InterviewOrchestrator:
             status=memory.status,
             candidate=profile,
             interviewers=INTERVIEWERS,
+            max_duration_seconds=MAX_DURATION_SECONDS,
         )
 
     def get_session(self, user_id: str, session_id: str) -> InterviewMemory:
@@ -122,16 +126,60 @@ class InterviewOrchestrator:
         memory.turn_count += 1
         self._intelligence.update_memory(memory, answer)
 
-        if memory.turn_count >= 7:
+        # ── Early-exit: candidate explicitly wants to stop ──────────
+        if _candidate_wants_to_end(answer):
             memory.status = InterviewStatus.completed
             memory.completed_at = datetime.utcnow()
             memory.active_interviewer_id = InterviewerId.mba
             memory.speaker_history.append(InterviewerId.mba)
-            memory.last_speaker_reason = "Close the interview after enough turns for an MVP report."
+            memory.last_speaker_reason = "Candidate indicated they want to end the session."
             closing = (
-                "Thank you. We have enough to evaluate this round. "
-                "You may stop here and review the panel report."
+                "Understood — we will wrap up here. "
+                "The panel has noted your responses and will now prepare your evaluation report. "
+                "Please review your score and coaching feedback below."
             )
+            memory.transcript.append(
+                TranscriptTurn(
+                    speaker=TurnSpeaker.interviewer,
+                    interviewer_id=InterviewerId.mba,
+                    text=closing,
+                )
+            )
+            self._repository.save_memory(user_id, memory)
+            return self._turn_response(memory, closing)
+
+        # ── Check wall-clock limit ──────────────────────────────────
+        elapsed = (datetime.utcnow() - memory.started_at).total_seconds()
+        time_is_up = elapsed >= MAX_DURATION_SECONDS
+
+        # ── Smart completion: enough substance even if under hard cap ─
+        sufficient = _transcript_is_sufficient(memory)
+
+        if memory.turn_count >= 12 or time_is_up or sufficient:
+            memory.status = InterviewStatus.completed
+            memory.completed_at = datetime.utcnow()
+            memory.active_interviewer_id = InterviewerId.mba
+            memory.speaker_history.append(InterviewerId.mba)
+            if time_is_up and not sufficient:
+                memory.last_speaker_reason = "Interview time limit reached — closing the panel session."
+                closing = (
+                    "Thank you — our time is up for this round. "
+                    "The panel will now prepare your evaluation report. "
+                    "Please review your score and coaching feedback below."
+                )
+            elif sufficient and memory.turn_count < 12:
+                memory.last_speaker_reason = "Transcript contains sufficient evidence — closing early."
+                closing = (
+                    "The panel has gathered enough depth to evaluate you properly. "
+                    "We will close here and prepare your detailed report. "
+                    "Well done — please review your score below."
+                )
+            else:
+                memory.last_speaker_reason = "Interview completed after full round of questions."
+                closing = (
+                    "Thank you — that completes this panel round. "
+                    "You may review your evaluation report below."
+                )
             memory.transcript.append(
                 TranscriptTurn(
                     speaker=TurnSpeaker.interviewer,
@@ -212,3 +260,64 @@ class InterviewOrchestrator:
             status=memory.status,
             transcript=memory.transcript,
         )
+
+
+# ─── Module-level helpers ──────────────────────────────────────────────────────
+
+_END_PHRASES = [
+    "i want to end",
+    "i want to stop",
+    "end the interview",
+    "stop the interview",
+    "let's wrap up",
+    "let us wrap up",
+    "wrap up the interview",
+    "i'm done",
+    "i am done",
+    "that's all from me",
+    "that is all from me",
+    "no more questions",
+    "i'd like to end",
+    "i would like to end",
+    "please end",
+    "close the interview",
+    "finish the interview",
+]
+
+
+def _candidate_wants_to_end(answer: str) -> bool:
+    """Return True when the candidate's answer signals they want to stop."""
+    lower = answer.lower().strip()
+    return any(phrase in lower for phrase in _END_PHRASES)
+
+
+def _transcript_is_sufficient(memory: InterviewMemory) -> bool:
+    """Return True when the transcript has enough evidence to produce a quality report.
+
+    Criteria (all must hold):
+    - At least 4 candidate turns
+    - At least 4 distinct topics touched
+    - At least 2 substantive answers (>=40 words each)
+    - At least one turn from each of the three interviewers
+    """
+    candidate_turns = [
+        t for t in memory.transcript if t.speaker == TurnSpeaker.candidate
+    ]
+    if len(candidate_turns) < 4:
+        return False
+
+    topics_covered = set(memory.topics_covered)
+    if len(topics_covered) < 4:
+        return False
+
+    substantive = sum(1 for t in candidate_turns if len(t.text.split()) >= 40)
+    if substantive < 2:
+        return False
+
+    # All three interviewers must have spoken at least once
+    panelists = {t.interviewer_id for t in memory.transcript if t.speaker == TurnSpeaker.interviewer}
+    if len(panelists) < 3:
+        return False
+
+    return True
+
