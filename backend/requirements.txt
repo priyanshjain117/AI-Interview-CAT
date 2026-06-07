@@ -10,3 +10,4 @@ langgraph==0.2.60
 PyMuPDF==1.25.1
 faster-whisper==1.1.0
 kokoro==0.9.4
+supabase==2.10.0

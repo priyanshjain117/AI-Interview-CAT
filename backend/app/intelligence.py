@@ -2,19 +2,26 @@ import json
 import os
 import re
 from collections import Counter
+from difflib import SequenceMatcher
 from typing import Any
 
 from app.models import (
+    BenchmarkCategory,
     CandidateClaim,
     CandidateProfile,
     CreateSessionRequest,
     DimensionScore,
     FollowUpOpportunity,
+    FollowUpCoachingItem,
     InterviewMemory,
     InterviewReport,
     InterviewerObservation,
     InterviewerId,
+    ProgressAnalysis,
     SpeakerSelection,
+    TopicState,
+    TopicStatus,
+    TranscriptEvidence,
     TranscriptTurn,
     TurnSpeaker,
 )
@@ -36,17 +43,133 @@ PROFILE_FIELDS = [
     "notable_resume_claims",
 ]
 
+TOPIC_COVERAGE = [
+    "academics",
+    "projects",
+    "internships",
+    "leadership",
+    "career goals",
+    "MBA motivation",
+    "current affairs",
+    "strengths",
+    "weaknesses",
+]
+
+TOPIC_ALIASES = {
+    "education": "academics",
+    "academic": "academics",
+    "academics": "academics",
+    "projects": "projects",
+    "project": "projects",
+    "internship": "internships",
+    "internships": "internships",
+    "work": "internships",
+    "experience": "internships",
+    "career_goals": "career goals",
+    "career goals": "career goals",
+    "career": "career goals",
+    "why mba": "MBA motivation",
+    "mba motivation": "MBA motivation",
+    "business school": "MBA motivation",
+    "business impact": "projects",
+    "measurable impact": "projects",
+    "current affairs": "current affairs",
+    "general awareness": "current affairs",
+    "strength": "strengths",
+    "strengths": "strengths",
+    "weakness": "weaknesses",
+    "weaknesses": "weaknesses",
+    "consistency": "weaknesses",
+}
+
 TOPIC_TO_INTERVIEWER = {
-    "education": InterviewerId.academic,
+    "academics": InterviewerId.academic,
     "projects": InterviewerId.academic,
     "internships": InterviewerId.academic,
     "skills": InterviewerId.academic,
     "achievements": InterviewerId.pressure,
-    "career_goals": InterviewerId.mba,
-    "why mba": InterviewerId.mba,
+    "career goals": InterviewerId.mba,
+    "MBA motivation": InterviewerId.mba,
     "leadership": InterviewerId.mba,
-    "business impact": InterviewerId.mba,
+    "current affairs": InterviewerId.pressure,
+    "strengths": InterviewerId.pressure,
+    "weaknesses": InterviewerId.pressure,
 }
+
+TOPIC_DEPTH_LADDERS = {
+    "projects": [
+        "problem",
+        "architecture",
+        "technical decisions",
+        "tradeoffs",
+        "business impact",
+    ],
+    "academics": [
+        "conceptual foundation",
+        "application",
+        "edge cases",
+        "tradeoffs",
+        "business relevance",
+    ],
+    "internships": [
+        "role scope",
+        "ownership",
+        "decisions",
+        "stakeholder tradeoffs",
+        "measured impact",
+    ],
+    "leadership": [
+        "situation",
+        "people challenge",
+        "decision",
+        "conflict or tradeoff",
+        "learning",
+    ],
+    "career goals": [
+        "target role",
+        "reasoning",
+        "skills gap",
+        "market understanding",
+        "long-term coherence",
+    ],
+    "MBA motivation": [
+        "why now",
+        "skills gap",
+        "school fit",
+        "post-MBA path",
+        "alternative paths",
+    ],
+    "current affairs": [
+        "awareness",
+        "stakeholders",
+        "economic reasoning",
+        "tradeoffs",
+        "managerial implication",
+    ],
+    "strengths": [
+        "claim",
+        "evidence",
+        "replicability",
+        "limits",
+        "MBA relevance",
+    ],
+    "weaknesses": [
+        "self-awareness",
+        "specific incident",
+        "root cause",
+        "corrective action",
+        "progress evidence",
+    ],
+}
+
+QUALITY_RULES = [
+    "New Topic",
+    "Deeper Investigation",
+    "Contradiction Challenge",
+    "Business Impact Analysis",
+    "Leadership Evaluation",
+    "MBA Fit Assessment",
+]
 
 
 class InterviewIntelligence:
@@ -77,6 +200,7 @@ class InterviewIntelligence:
         return self._extract_profile_locally(base)
 
     def generate_opening_question(self, memory: InterviewMemory) -> str:
+        self._ensure_topic_states(memory)
         topic = self._first_available(
             memory.candidate.projects,
             memory.candidate.internships,
@@ -92,21 +216,35 @@ class InterviewIntelligence:
             latest_answer="",
             selection_reason="Begin with resume-grounded academic and profile validation.",
             opening_topic=topic,
+            selected_topic="projects" if memory.candidate.projects else "academics",
         )
 
     def update_memory(self, memory: InterviewMemory, latest_answer: str) -> None:
+        self._ensure_topic_states(memory)
+        latest_answer = self._sanitize_candidate_text(latest_answer)
         if self.client:
             updated = self._update_memory_with_groq(memory, latest_answer)
             if updated:
                 self._merge_memory_update(memory, updated)
+                model_topics = [
+                    self._canonical_topic(topic)
+                    for topic in self._as_string_list(updated.get("topics_covered"))
+                ]
+                self._update_topic_evidence(
+                    memory,
+                    latest_answer,
+                    self._dedupe(model_topics + self._topics_from_answer(latest_answer)),
+                )
                 return
 
         self._update_memory_locally(memory, latest_answer)
 
     def select_speaker(self, memory: InterviewMemory) -> SpeakerSelection:
+        self._ensure_topic_states(memory)
         if self.client:
             selection = self._select_speaker_with_groq(memory)
             if selection:
+                selection.topic = self._viable_selected_topic(memory, selection.topic)
                 memory.last_speaker_reason = selection.reason
                 return selection
 
@@ -121,25 +259,41 @@ class InterviewIntelligence:
         latest_answer: str,
         selection_reason: str,
         opening_topic: str = "",
+        selected_topic: str = "",
     ) -> str:
+        self._ensure_topic_states(memory)
+        selected_topic = self._canonical_topic(selected_topic or self._topic_from_reason(selection_reason))
+        latest_answer = self._sanitize_candidate_text(latest_answer)
         if self.client:
             question = self._generate_question_with_groq(
-                memory, interviewer_id, latest_answer, selection_reason, opening_topic
+                memory, interviewer_id, latest_answer, selection_reason, opening_topic, selected_topic
             )
             if question:
-                return question
+                return self._finalize_question(memory, question, interviewer_id, selected_topic, latest_answer)
 
         return self._generate_question_locally(
-            memory, interviewer_id, latest_answer, selection_reason, opening_topic
+            memory, interviewer_id, latest_answer, selection_reason, opening_topic, selected_topic
         )
 
     def generate_report(self, memory: InterviewMemory) -> InterviewReport:
+        self._ensure_topic_states(memory)
         if self.client:
             report = self._generate_report_with_groq(memory)
             if report:
                 return report
 
         return self._generate_report_locally(memory)
+
+    def _viable_selected_topic(self, memory: InterviewMemory, topic: str) -> str:
+        if topic:
+            canonical = self._canonical_topic(topic)
+            state = self._topic_state(memory, canonical)
+            if state.status not in {TopicStatus.closed, TopicStatus.sufficiently_tested}:
+                return canonical
+        open_topics = self._open_topics(memory)
+        if open_topics:
+            return open_topics[0]
+        return self._least_tested_reopenable_topic(memory) or "projects"
 
     def _chat_json(self, system: str, user: str, temperature: float = 0.25) -> dict[str, Any] | None:
         if not self.client:
@@ -222,7 +376,8 @@ class InterviewIntelligence:
         candidate_lines = [
             line
             for line in self._candidate_lines(text)
-            if any(
+            if not self._is_bad_anchor(line)
+            and any(
                 keyword in line.lower()
                 for keyword in [
                     "led",
@@ -294,9 +449,9 @@ class InterviewIntelligence:
         return self._chat_json(system, user)
 
     def _merge_memory_update(self, memory: InterviewMemory, data: dict[str, Any]) -> None:
-        memory.topics_covered = self._merge_strings(
-            memory.topics_covered, self._as_string_list(data.get("topics_covered"))
-        )
+        topics = [self._canonical_topic(topic) for topic in self._as_string_list(data.get("topics_covered"))]
+        topics = [topic for topic in topics if topic]
+        memory.topics_covered = self._merge_strings(memory.topics_covered, topics)
         memory.strengths = self._merge_strings(memory.strengths, self._as_string_list(data.get("strengths")))
         memory.weaknesses = self._merge_strings(
             memory.weaknesses, self._as_string_list(data.get("weaknesses"))
@@ -320,10 +475,13 @@ class InterviewIntelligence:
 
         for raw_claim in data.get("candidate_claims") or []:
             if isinstance(raw_claim, dict) and raw_claim.get("text"):
+                claim_text = self._sanitize_candidate_text(str(raw_claim["text"]))
+                if not claim_text or self._is_bad_anchor(claim_text):
+                    continue
                 claim = CandidateClaim(
-                    text=str(raw_claim["text"])[:220],
+                    text=claim_text[:220],
                     source="interview",
-                    evidence=str(raw_claim.get("evidence") or raw_claim["text"])[:220],
+                    evidence=self._sanitize_candidate_text(str(raw_claim.get("evidence") or claim_text))[:220],
                     challenged=bool(raw_claim.get("challenged", False)),
                 )
                 if claim.text not in memory.claims:
@@ -332,7 +490,7 @@ class InterviewIntelligence:
         for raw_follow_up in data.get("unanswered_follow_up_opportunities") or []:
             if not isinstance(raw_follow_up, dict):
                 continue
-            topic = str(raw_follow_up.get("topic") or "").strip()
+            topic = self._canonical_topic(str(raw_follow_up.get("topic") or "").strip())
             reason = str(raw_follow_up.get("reason") or "").strip()
             if not topic or not reason:
                 continue
@@ -341,7 +499,7 @@ class InterviewIntelligence:
                 topic=topic[:80],
                 reason=reason[:180],
                 suggested_interviewer=interviewer,
-                source_claim=str(raw_follow_up.get("source_claim") or "")[:220],
+                source_claim=self._sanitize_candidate_text(str(raw_follow_up.get("source_claim") or ""))[:220],
             )
             if opportunity.reason not in [item.reason for item in memory.unanswered_follow_up_opportunities]:
                 memory.unanswered_follow_up_opportunities.append(opportunity)
@@ -350,20 +508,29 @@ class InterviewIntelligence:
         lower = latest_answer.lower()
         topics = []
         topic_keywords = {
-            "education": ["college", "cgpa", "degree", "semester", "academic"],
+            "academics": ["college", "cgpa", "degree", "semester", "academic", "subject", "course"],
             "projects": ["project", "built", "created", "developed"],
             "internships": ["intern", "trainee", "work", "company"],
-            "why mba": ["mba", "management", "business school"],
+            "MBA motivation": ["mba", "management", "business school"],
+            "career goals": ["career", "product", "consulting", "strategy", "goal"],
             "leadership": ["lead", "team", "organized", "managed"],
-            "business impact": ["revenue", "cost", "customer", "market", "profit", "growth"],
+            "current affairs": ["economy", "policy", "market", "inflation", "budget", "geopolitics"],
+            "strengths": ["strength", "good at", "strong"],
+            "weaknesses": ["weakness", "improve", "struggle"],
         }
         for topic, keywords in topic_keywords.items():
             if any(keyword in lower for keyword in keywords):
                 topics.append(topic)
         memory.topics_covered = self._merge_strings(memory.topics_covered, topics)
+        if not topics:
+            last_topic = self._last_interviewer_topic(memory)
+            if last_topic:
+                topics.append(last_topic)
+        self._update_topic_evidence(memory, latest_answer, topics)
 
         first_sentence = latest_answer.split(".")[0].strip()
-        if first_sentence and first_sentence not in memory.claims:
+        first_sentence = self._sanitize_candidate_text(first_sentence)
+        if first_sentence and not self._is_bad_anchor(first_sentence) and first_sentence not in memory.claims:
             memory.candidate_claims.append(
                 CandidateClaim(text=first_sentence[:220], evidence=first_sentence[:220])
             )
@@ -379,7 +546,7 @@ class InterviewIntelligence:
             )
             memory.unanswered_follow_up_opportunities.append(
                 FollowUpOpportunity(
-                    topic=topics[0] if topics else "specific evidence",
+                    topic=topics[0] if topics else "weaknesses",
                     reason="Candidate gave a short answer that needs a concrete incident and measurable result.",
                     suggested_interviewer=InterviewerId.pressure,
                     source_claim=first_sentence[:180],
@@ -393,7 +560,7 @@ class InterviewIntelligence:
         else:
             memory.unanswered_follow_up_opportunities.append(
                 FollowUpOpportunity(
-                    topic="measurable impact",
+                    topic=topics[0] if topics else "projects",
                     reason="Candidate did not provide numbers, trade-offs, or measurable impact.",
                     suggested_interviewer=InterviewerId.mba,
                     source_claim=first_sentence[:180],
@@ -405,7 +572,7 @@ class InterviewIntelligence:
             memory.contradictions = self._merge_strings(memory.contradictions, [contradiction])
             memory.unanswered_follow_up_opportunities.append(
                 FollowUpOpportunity(
-                    topic="consistency",
+                    topic="weaknesses",
                     reason="Candidate appears to have made inconsistent claims that should be challenged.",
                     suggested_interviewer=InterviewerId.pressure,
                     source_claim=contradiction,
@@ -422,7 +589,11 @@ class InterviewIntelligence:
                 "candidate_profile": self._profile_payload(memory.candidate),
                 "memory": self._memory_payload(memory),
                 "speaker_counts": Counter(str(item.value) for item in memory.speaker_history),
-                "required_shape": {"speaker": "academic|pressure|mba", "reason": "selection reason"},
+                "required_shape": {
+                    "speaker": "academic|pressure|mba",
+                    "reason": "selection reason",
+                    "topic": "topic to test next",
+                },
             }
         )
         data = self._chat_json(system, user)
@@ -430,28 +601,41 @@ class InterviewIntelligence:
             return None
         speaker = self._parse_interviewer(data.get("speaker"))
         reason = str(data.get("reason") or "Selected from shared interview memory.").strip()
-        return SpeakerSelection(speaker=speaker, reason=reason[:220])
+        topic = str(data.get("topic") or "").strip()
+        return SpeakerSelection(speaker=speaker, reason=reason[:220], topic=topic[:80])
 
     def _select_speaker_locally(self, memory: InterviewMemory) -> SpeakerSelection:
         if memory.contradictions:
             return SpeakerSelection(
                 speaker=InterviewerId.pressure,
                 reason="Open contradiction exists and should be stress-tested before moving on.",
+                topic="consistency",
             )
 
         if memory.unanswered_follow_up_opportunities:
-            opportunity = memory.unanswered_follow_up_opportunities.pop(0)
-            return SpeakerSelection(
-                speaker=opportunity.suggested_interviewer,
-                reason=f"Follow up on {opportunity.topic}: {opportunity.reason}",
-            )
+            opportunity = self._next_viable_follow_up(memory)
+            if opportunity:
+                return SpeakerSelection(
+                    speaker=opportunity.suggested_interviewer,
+                    reason=f"Follow up on {opportunity.topic}: {opportunity.reason}",
+                    topic=opportunity.topic,
+                )
 
         open_topics = self._open_topics(memory)
         if open_topics:
             topic = open_topics[0]
             return SpeakerSelection(
                 speaker=TOPIC_TO_INTERVIEWER.get(topic, InterviewerId.mba),
-                reason=f"{topic} is under-tested for this candidate.",
+                reason=f"{topic} is under-tested for balanced IIM-style coverage.",
+                topic=topic,
+            )
+
+        reopenable = self._least_tested_reopenable_topic(memory)
+        if reopenable:
+            return SpeakerSelection(
+                speaker=TOPIC_TO_INTERVIEWER.get(reopenable, InterviewerId.mba),
+                reason=f"Use a different angle on {reopenable} to complete depth without repetition.",
+                topic=reopenable,
             )
 
         counts = Counter(memory.speaker_history)
@@ -460,6 +644,7 @@ class InterviewIntelligence:
         return SpeakerSelection(
             speaker=speaker,
             reason="Balance the panel after resolving the available memory signals.",
+            topic="panel balance",
         )
 
     def _generate_question_with_groq(
@@ -469,13 +654,19 @@ class InterviewIntelligence:
         latest_answer: str,
         selection_reason: str,
         opening_topic: str,
+        selected_topic: str,
     ) -> str | None:
         system = (
             f"You are the {interviewer_id.value} interviewer in PANELIQ, an IIM-style MBA "
             "admissions panel. Ask exactly one concise spoken question. "
             "Use the shared memory and resume. Continue another interviewer's thread when useful. "
-            "Do not explain your reasoning. Do not ask generic chatbot questions."
+            "Do not explain your reasoning. Do not ask generic chatbot questions. "
+            "Never quote candidate filler or raw transcript fragments. Every question must be professional "
+            "and must satisfy one of: New Topic, Deeper Investigation, Contradiction Challenge, "
+            "Business Impact Analysis, Leadership Evaluation, MBA Fit Assessment."
         )
+        topic_state = self._topic_state(memory, selected_topic)
+        next_depth = min(topic_state.depth_level + 1, 5)
         user = json.dumps(
             {
                 "interviewer_role": self._role_for(interviewer_id),
@@ -483,6 +674,18 @@ class InterviewIntelligence:
                 "interview_memory": self._memory_payload(memory),
                 "latest_candidate_response": latest_answer,
                 "speaker_selection_reason": selection_reason,
+                "selected_topic": selected_topic,
+                "required_next_depth": next_depth,
+                "depth_focus": self._depth_focus(selected_topic, next_depth),
+                "asked_questions": memory.asked_questions[-12:],
+                "quality_rules": QUALITY_RULES,
+                "banned_patterns": [
+                    "Tell me more",
+                    "I don't know what to answer",
+                    "what to answer",
+                    "repeat the same question in different words",
+                    "verbatim candidate speech",
+                ],
                 "opening_topic": opening_topic,
                 "required_shape": {
                     "question": "one interviewer question",
@@ -512,14 +715,14 @@ class InterviewIntelligence:
         latest_answer: str,
         selection_reason: str,
         opening_topic: str,
+        selected_topic: str,
     ) -> str:
-        claim = self._last_claim(memory) or opening_topic or "your resume"
-        resume_anchor = self._first_available(
-            memory.candidate.projects,
-            memory.candidate.internships,
-            memory.candidate.notable_resume_claims,
-            [claim],
-        )
+        topic = self._canonical_topic(selected_topic or self._topic_from_reason(selection_reason))
+        topic_state = self._topic_state(memory, topic)
+        next_depth = min(topic_state.depth_level + 1, 5)
+        depth_focus = self._depth_focus(topic, next_depth)
+        claim = self._safe_question_anchor(self._last_claim(memory) or opening_topic or "your background")
+        resume_anchor = self._anchor_for_topic(memory, topic, claim, opening_topic)
 
         if interviewer_id == InterviewerId.academic:
             memory.interviewer_observations.append(
@@ -529,10 +732,17 @@ class InterviewIntelligence:
                     evidence=self._clean_anchor(resume_anchor)[:220],
                 )
             )
-            return (
-                f"Your resume mentions {self._clean_anchor(resume_anchor)}. Walk me through the core idea, "
-                "your exact contribution, and one technical or academic trade-off you handled."
-            )
+            if topic == "academics":
+                question = (
+                    f"On {self._safe_question_anchor(resume_anchor)}, take us to the {depth_focus} level: "
+                    "which concept matters most, where is it applied, and what limitation should a manager know?"
+                )
+            else:
+                question = (
+                    f"Your resume mentions {self._safe_question_anchor(resume_anchor)}. At the {depth_focus} level, "
+                    "what exactly did you build or decide, and what trade-off did that create?"
+                )
+            return self._finalize_question(memory, question, interviewer_id, topic, latest_answer)
         if interviewer_id == InterviewerId.pressure:
             memory.interviewer_observations.append(
                 InterviewerObservation(
@@ -541,10 +751,27 @@ class InterviewIntelligence:
                     evidence=claim[:220],
                 )
             )
-            return (
-                f"I want to test that claim: {claim}. Give me the specific incident, "
-                "what you personally did, and evidence that the outcome changed because of you."
-            )
+            if memory.contradictions:
+                question = (
+                    f"There is a consistency issue in your earlier answers. At the {depth_focus} level, "
+                    "which version should the panel rely on, and what evidence supports it?"
+                )
+            elif topic == "weaknesses":
+                question = (
+                    "Choose one genuine weakness from a recent situation. What caused it, what corrective "
+                    "action have you taken, and what evidence shows progress?"
+                )
+            elif topic == "current affairs":
+                question = (
+                    "Pick one current business or economic issue you have followed recently. What are the "
+                    "stakeholder trade-offs, and what managerial judgment would you make?"
+                )
+            else:
+                question = (
+                    f"I want to test the ownership behind {claim}. At the {depth_focus} level, "
+                    "what evidence shows this was your contribution and not just a team outcome?"
+                )
+            return self._finalize_question(memory, question, interviewer_id, topic, latest_answer)
         memory.interviewer_observations.append(
             InterviewerObservation(
                 interviewer_id=interviewer_id,
@@ -552,10 +779,27 @@ class InterviewIntelligence:
                 evidence=claim[:220],
             )
         )
-        return (
-            f"Let us connect this to management. Taking {claim} as the context, "
-            "what was the business impact, who was the customer or stakeholder, and why does this make an MBA necessary now?"
-        )
+        if topic == "MBA motivation":
+            question = (
+                f"At the {depth_focus} level, why is an MBA necessary now rather than learning on the job, "
+                "and what specific gap are you trying to close?"
+            )
+        elif topic == "career goals":
+            question = (
+                f"At the {depth_focus} level, connect your short-term role, target industry, and long-term goal. "
+                "What would make that path credible to this panel?"
+            )
+        elif topic == "leadership":
+            question = (
+                f"At the {depth_focus} level, describe a leadership decision where people disagreed with you. "
+                "What trade-off did you choose, and what changed afterwards?"
+            )
+        else:
+            question = (
+                f"Let us connect {claim} to management. At the {depth_focus} level, what metric or stakeholder "
+                "outcome changed, and what would you do differently now?"
+            )
+        return self._finalize_question(memory, question, interviewer_id, topic, latest_answer)
 
     def _generate_report_with_groq(self, memory: InterviewMemory) -> InterviewReport | None:
         system = (
@@ -568,12 +812,33 @@ class InterviewIntelligence:
                 "memory": self._memory_payload(memory),
                 "transcript": self._transcript_payload(memory.transcript),
                 "required_shape": {
-                    "verdict": "Strong Hire|Lean Hire|Lean Reject|Strong Reject",
+                    "verdict": "Likely Convert|Borderline|Needs Improvement",
                     "overall_score": "number from 1-10",
+                    "executive_summary": "concise panel-level summary grounded in transcript evidence",
                     "strengths": ["evidence-backed strengths"],
                     "weaknesses": ["evidence-backed weaknesses"],
                     "panel_concerns": ["major concerns"],
                     "feedback_to_candidate": "short summary",
+                    "transcript_evidence": [
+                        {
+                            "topic": "covered topic",
+                            "evidence": "short transcript-backed evidence",
+                            "panel_interpretation": "what the panel inferred",
+                        }
+                    ],
+                    "recommended_improvements": ["specific improvements for next interview"],
+                    "panel_comments": ["realistic panel comments"],
+                    "benchmarking": [
+                        {
+                            "category": "Typical IIM Convert Candidate|Strong IIM ABC Candidate|Average CAT Aspirant",
+                            "communication": "percentile range",
+                            "leadership": "percentile range",
+                            "business_awareness": "percentile range",
+                            "academic_depth": "percentile range",
+                            "mba_fit": "percentile range",
+                            "notes": "preparedness comparison, not admission prediction",
+                        }
+                    ],
                     "dimensions": [
                         {
                             "name": "Communication clarity",
@@ -617,12 +882,25 @@ class InterviewIntelligence:
                 return None
             return InterviewReport(
                 session_id=memory.session_id,
-                verdict=data.get("verdict") or "Lean Reject",
+                verdict=self._normalize_verdict(str(data.get("verdict") or "")),
                 overall_score=float(data.get("overall_score") or 0),
+                executive_summary=str(data.get("executive_summary") or data.get("feedback_to_candidate") or ""),
                 strengths=self._as_string_list(data.get("strengths")),
                 weaknesses=self._as_string_list(data.get("weaknesses")),
                 panel_concerns=self._as_string_list(data.get("panel_concerns")),
                 dimensions=dimensions,
+                transcript_evidence=self._parse_transcript_evidence(data.get("transcript_evidence")),
+                recommended_improvements=self._as_string_list(data.get("recommended_improvements")),
+                panel_comments=self._as_string_list(data.get("panel_comments")),
+                benchmarking=self._parse_benchmarks(data.get("benchmarking")),
+                mba_readiness_assessment=str(
+                    data.get("mba_readiness_assessment")
+                    or "MBA readiness is based only on the evidence demonstrated in this interview."
+                ),
+                coaching_items=self.generate_coaching_items(
+                    self._as_string_list(data.get("weaknesses")),
+                    self._parse_transcript_evidence(data.get("transcript_evidence")),
+                ),
                 feedback_to_candidate=str(data.get("feedback_to_candidate") or ""),
                 transcript=memory.transcript,
             )
@@ -634,41 +912,48 @@ class InterviewIntelligence:
             turn.text for turn in memory.transcript if turn.speaker == TurnSpeaker.candidate
         ]
         transcript_text = " ".join(candidate_turns)
-        total_words = sum(len(turn.split()) for turn in candidate_turns)
         tested_topics = set(memory.topics_covered)
         evidence_quote = self._evidence_excerpt(candidate_turns)
+        transcript_evidence = self._build_transcript_evidence(memory, candidate_turns)
+        has_candidate_evidence = bool(candidate_turns)
+        has_specific_evidence = any(
+            any(marker in turn.lower() for marker in ["i ", "my ", "because", "trade", "impact", "%"])
+            or any(char.isdigit() for char in turn)
+            for turn in candidate_turns
+        )
+        communication_score = 7.0 if has_specific_evidence else 5.5 if has_candidate_evidence else None
 
         dimensions = [
             self._dimension(
                 "Communication clarity",
-                7.0 if total_words >= 180 else 6.0 if total_words >= 70 else None,
+                communication_score,
                 evidence_quote,
-                ["Candidate gave developed responses."] if total_words >= 180 else [],
-                ["Insufficient response depth."] if total_words < 70 else [],
+                ["Used concrete transcript evidence in answers."] if has_specific_evidence else [],
+                [] if has_specific_evidence else ["Transcript lacks enough specific evidence."],
                 "Use a direct answer, one example, and a quantified result.",
             ),
             self._dimension(
                 "Academic depth",
-                7.0 if {"education", "projects"} & tested_topics else None,
+                7.0 if {"academics", "projects"} & tested_topics and has_candidate_evidence else None,
                 self._topic_evidence(
                     candidate_turns,
                     ["project", "built", "dashboard", "salesforce", "college", "cgpa", "degree"],
                 ),
-                ["Discussed academic or project material."] if {"education", "projects"} & tested_topics else [],
-                [] if {"education", "projects"} & tested_topics else ["Academic depth was not sufficiently tested."],
+                ["Discussed academic or project material."] if {"academics", "projects"} & tested_topics else [],
+                [] if {"academics", "projects"} & tested_topics else ["Academic depth was not sufficiently tested."],
                 "Prepare one project and one academic subject at concept, trade-off, and impact levels.",
             ),
             self._dimension(
                 "Business awareness",
-                7.0 if "business impact" in tested_topics else None,
+                7.0 if "current affairs" in tested_topics or self._contains_any(transcript_text, ["revenue", "cost", "customer", "market", "profit"]) else None,
                 self._topic_evidence(candidate_turns, ["revenue", "cost", "customer", "market", "profit"]),
-                ["Connected answers to business impact."] if "business impact" in tested_topics else [],
-                [] if "business impact" in tested_topics else ["Business impact was not demonstrated clearly."],
+                ["Connected answers to business impact."] if self._contains_any(transcript_text, ["revenue", "cost", "customer", "market", "profit"]) else [],
+                [] if self._contains_any(transcript_text, ["revenue", "cost", "customer", "market", "profit"]) else ["Business impact was not demonstrated clearly."],
                 "Translate projects into customer, cost, revenue, risk, and stakeholder language.",
             ),
             self._dimension(
                 "Leadership potential",
-                7.0 if "leadership" in tested_topics else None,
+                7.0 if "leadership" in tested_topics or self._contains_any(transcript_text, ["led", "team", "owned", "managed"]) else None,
                 self._topic_evidence(candidate_turns, ["lead", "team", "managed", "organized"]),
                 ["Mentioned leadership or team ownership."] if "leadership" in tested_topics else [],
                 [] if "leadership" in tested_topics else ["Leadership evidence was not sufficiently tested."],
@@ -676,7 +961,7 @@ class InterviewIntelligence:
             ),
             self._dimension(
                 "Career clarity",
-                7.0 if "why mba" in tested_topics or "mba" in transcript_text.lower() else None,
+                7.0 if {"career goals", "MBA motivation"} & tested_topics or "mba" in transcript_text.lower() else None,
                 self._topic_evidence(candidate_turns, ["mba", "career", "product", "consulting", "strategy"]),
                 ["Addressed MBA or career direction."] if "mba" in transcript_text.lower() else [],
                 [] if "mba" in transcript_text.lower() else ["MBA motivation was not established."],
@@ -690,27 +975,388 @@ class InterviewIntelligence:
                 memory.weaknesses[:2],
                 "When challenged, acknowledge the concern and answer with specific evidence.",
             ),
+            self._dimension(
+                "Answer structure",
+                7.0 if has_specific_evidence and not memory.contradictions else 5.5 if has_candidate_evidence else None,
+                evidence_quote,
+                ["Answers contained claim, action, or impact evidence."] if has_specific_evidence else [],
+                memory.contradictions[:2] or ([] if has_specific_evidence else ["Answers need clearer evidence structure."]),
+                "Use claim, context, action, result, and learning for each answer.",
+            ),
+            self._dimension(
+                "Overall admissions readiness",
+                None,
+                evidence_quote,
+                memory.strengths[:2],
+                memory.weaknesses[:2],
+                "Prepare resume anchors at academic, pressure, and MBA-fit depth.",
+            ),
         ]
 
         scored = [item.score for item in dimensions if item.score is not None]
         overall = round(sum(scored) / len(scored), 1) if scored else 0.0
         verdict = self._verdict(overall)
         weaknesses = memory.weaknesses or ["The transcript does not yet contain enough evidence for a rigorous evaluation."]
+        recommended = self._recommended_improvements(memory, dimensions)
+        panel_comments = self._panel_comments(memory, overall)
+        executive_summary = self._executive_summary(overall, tested_topics, evidence_quote)
 
         return InterviewReport(
             session_id=memory.session_id,
             verdict=verdict,
             overall_score=overall,
+            executive_summary=executive_summary,
             strengths=memory.strengths[:5],
             weaknesses=weaknesses[:5],
             panel_concerns=(memory.contradictions + weaknesses)[:5],
             dimensions=dimensions,
+            transcript_evidence=transcript_evidence,
+            recommended_improvements=recommended,
+            panel_comments=panel_comments,
+            benchmarking=self._benchmarking(overall, dimensions),
+            mba_readiness_assessment=self._mba_readiness_assessment(overall, dimensions),
+            coaching_items=self.generate_coaching_items(weaknesses[:5], transcript_evidence),
             feedback_to_candidate=(
                 "This report uses only transcript evidence. Strengthen the next attempt with concrete "
                 "incidents, quantified outcomes, and clearer MBA linkage."
             ),
             transcript=memory.transcript,
         )
+
+    def generate_coaching_items(
+        self, weaknesses: list[str], evidence: list[TranscriptEvidence] | None = None
+    ) -> list[FollowUpCoachingItem]:
+        evidence = evidence or []
+        if self.client and weaknesses:
+            generated = self._generate_coaching_with_groq(weaknesses, evidence)
+            if generated:
+                return generated
+        return [self._local_coaching_item(weakness, evidence) for weakness in weaknesses[:6]]
+
+    def analyze_progress(self, reports: list[InterviewReport]) -> ProgressAnalysis:
+        if len(reports) < 2:
+            latest = reports[-1] if reports else None
+            return ProgressAnalysis(
+                growth_summary=(
+                    "Complete another interview to unlock trend analysis."
+                    if latest
+                    else "No completed reports are available yet."
+                ),
+                next_focus_areas=(latest.weaknesses[:3] if latest else []),
+                recurring_weaknesses=(latest.weaknesses[:3] if latest else []),
+            )
+        first = reports[0]
+        latest = reports[-1]
+        first_scores = self._dimension_score_map(first)
+        latest_scores = self._dimension_score_map(latest)
+        improved = []
+        declining = []
+        for name, latest_score in latest_scores.items():
+            previous = first_scores.get(name)
+            if latest_score is None or previous is None:
+                continue
+            delta = latest_score - previous
+            if delta >= 0.5:
+                improved.append(f"{name} improved by {delta:.1f} points.")
+            elif delta <= -0.5:
+                declining.append(f"{name} declined by {abs(delta):.1f} points.")
+        weakness_counts = Counter(
+            self._normalize_for_compare(item)
+            for report in reports
+            for item in report.weaknesses
+            if item
+        )
+        recurring = [
+            weakness for weakness in latest.weaknesses
+            if weakness_counts[self._normalize_for_compare(weakness)] >= 2
+        ]
+        delta = latest.overall_score - first.overall_score
+        direction = "up" if delta >= 0 else "down"
+        return ProgressAnalysis(
+            improved_areas=improved[:6],
+            declining_areas=declining[:6],
+            recurring_weaknesses=recurring[:6],
+            growth_summary=f"Overall score moved {direction} by {abs(delta):.1f} points across {len(reports)} completed interviews.",
+            next_focus_areas=(recurring or latest.weaknesses or latest.recommended_improvements)[:5],
+        )
+
+    def compare_reports(self, left: InterviewReport, right: InterviewReport) -> dict[str, list[str]]:
+        left_scores = self._dimension_score_map(left)
+        right_scores = self._dimension_score_map(right)
+        changes = [f"Overall score changed by {right.overall_score - left.overall_score:+.1f} points."]
+        improved = []
+        remaining = []
+        observations = []
+        for name, right_score in right_scores.items():
+            left_score = left_scores.get(name)
+            if right_score is None or left_score is None:
+                continue
+            delta = right_score - left_score
+            if abs(delta) >= 0.3:
+                changes.append(f"{name}: {left_score:.1f} to {right_score:.1f} ({delta:+.1f}).")
+            if delta >= 0.5:
+                improved.append(name)
+        left_weak = {self._normalize_for_compare(item) for item in left.weaknesses}
+        for weakness in right.weaknesses:
+            if self._normalize_for_compare(weakness) in left_weak:
+                remaining.append(weakness)
+        observations.extend(right.panel_comments[:4])
+        observations.extend(right.panel_concerns[:3])
+        return {
+            "score_changes": changes[:8],
+            "improved_areas": improved[:8],
+            "remaining_weaknesses": remaining[:8],
+            "panel_observations": self._dedupe(observations)[:8],
+        }
+
+    def _build_transcript_evidence(
+        self, memory: InterviewMemory, candidate_turns: list[str]
+    ) -> list[TranscriptEvidence]:
+        items: list[TranscriptEvidence] = []
+        for state in memory.topic_states:
+            if not state.evidence_collected:
+                continue
+            evidence = state.evidence_collected[-1]
+            items.append(
+                TranscriptEvidence(
+                    topic=state.topic_name,
+                    evidence=evidence,
+                    panel_interpretation=self._interpret_evidence(state.topic_name, evidence),
+                )
+            )
+        if not items and candidate_turns:
+            items.append(
+                TranscriptEvidence(
+                    topic="general interview evidence",
+                    evidence=self._evidence_excerpt(candidate_turns),
+                    panel_interpretation="The panel had limited but usable answer evidence for initial feedback.",
+                )
+            )
+        return items[:8]
+
+    def _interpret_evidence(self, topic: str, evidence: str) -> str:
+        lower = evidence.lower()
+        if any(char.isdigit() for char in evidence):
+            return "Candidate used a concrete detail or number, which strengthens credibility."
+        if topic in {"projects", "internships"} and self._contains_any(lower, ["trade", "decision", "because"]):
+            return "Candidate showed some decision reasoning, though impact should be quantified."
+        if topic in {"MBA motivation", "career goals"}:
+            return "Candidate gave career or MBA-fit material that should be made more specific."
+        if topic == "leadership":
+            return "Candidate offered leadership material that needs clearer conflict, action, and outcome."
+        return "Evidence was present but should be made sharper and more measurable."
+
+    def _recommended_improvements(
+        self, memory: InterviewMemory, dimensions: list[DimensionScore]
+    ) -> list[str]:
+        recommendations = [
+            "Prepare one project at five depths: problem, architecture, decisions, tradeoffs, and business impact.",
+            "For every major claim, add a metric, stakeholder, trade-off, and personal contribution.",
+            "Practice concise answers using claim, context, action, result, and learning.",
+        ]
+        weak_dimensions = [item.name for item in dimensions if item.score is None or (item.score or 0) < 6.5]
+        if "Business awareness" in weak_dimensions:
+            recommendations.append("Read one current business issue daily and explain who gains, who loses, and why.")
+        if "Leadership potential" in weak_dimensions:
+            recommendations.append("Prepare a leadership story with disagreement, decision logic, and measurable outcome.")
+        if memory.contradictions:
+            recommendations.append("Resolve inconsistent resume or interview claims before the next mock.")
+        return self._dedupe(recommendations)[:6]
+
+    def _panel_comments(self, memory: InterviewMemory, overall: float) -> list[str]:
+        comments = []
+        if overall >= 7:
+            comments.append("Panel sees a credible candidate, but wants sharper quantification and business framing.")
+        elif overall > 0:
+            comments.append("Panel needs stronger evidence before forming a positive admissions-style view.")
+        else:
+            comments.append("Panel could not evaluate readiness because transcript evidence was too limited.")
+        for state in memory.topic_states:
+            if state.status == TopicStatus.closed:
+                comments.append(f"{state.topic_name}: sufficiently tested with usable evidence.")
+            elif state.questions_asked and not state.evidence_collected:
+                comments.append(f"{state.topic_name}: asked, but answer evidence remained thin.")
+        return comments[:6]
+
+    def _executive_summary(self, overall: float, tested_topics: set[str], evidence_quote: str) -> str:
+        coverage = ", ".join(sorted(tested_topics)) if tested_topics else "limited topic coverage"
+        if overall >= 7:
+            assessment = "The candidate showed interview readiness in parts"
+        elif overall > 0:
+            assessment = "The candidate showed partial readiness but needs stronger evidence"
+        else:
+            assessment = "The transcript was too thin for a rigorous readiness judgment"
+        return f"{assessment}. Covered areas: {coverage}. Representative evidence: {evidence_quote}"
+
+    def _benchmarking(
+        self, overall: float, dimensions: list[DimensionScore]
+    ) -> list[BenchmarkCategory]:
+        scores = {item.name: item.score for item in dimensions}
+
+        def band(score: float | None, offset: int = 0) -> str:
+            if score is None:
+                return "Insufficient evidence"
+            midpoint = max(25, min(95, int(score * 10) + offset))
+            return f"{max(1, midpoint - 8)}-{min(99, midpoint + 8)} percentile"
+
+        communication = scores.get("Communication clarity")
+        leadership = scores.get("Leadership potential")
+        business = scores.get("Business awareness")
+        academic = scores.get("Academic depth")
+        mba_fit = scores.get("Career clarity")
+        return [
+            BenchmarkCategory(
+                category="Typical IIM Convert Candidate",
+                communication=band(communication),
+                leadership=band(leadership),
+                business_awareness=band(business),
+                academic_depth=band(academic),
+                mba_fit=band(mba_fit),
+                notes="Preparedness comparison against generally successful interview behavior.",
+            ),
+            BenchmarkCategory(
+                category="Strong IIM ABC Candidate",
+                communication=band(communication, -10),
+                leadership=band(leadership, -12),
+                business_awareness=band(business, -12),
+                academic_depth=band(academic, -10),
+                mba_fit=band(mba_fit, -12),
+                notes="A stricter benchmark for highly polished interview readiness.",
+            ),
+            BenchmarkCategory(
+                category="Average CAT Aspirant",
+                communication=band(communication, 10),
+                leadership=band(leadership, 8),
+                business_awareness=band(business, 8),
+                academic_depth=band(academic, 8),
+                mba_fit=band(mba_fit, 8),
+                notes="Comparison to typical preparation quality, not selection likelihood.",
+            ),
+        ]
+
+    def _generate_coaching_with_groq(
+        self, weaknesses: list[str], evidence: list[TranscriptEvidence]
+    ) -> list[FollowUpCoachingItem] | None:
+        system = (
+            "You are an IIM admissions mentor. Return only JSON. "
+            "Generate coaching for demonstrated weaknesses without inventing candidate facts."
+        )
+        user = json.dumps(
+            {
+                "weaknesses": weaknesses[:6],
+                "transcript_evidence": [item.model_dump(mode="json") for item in evidence[:8]],
+                "required_shape": {
+                    "coaching_items": [
+                        {
+                            "weakness": "specific weakness",
+                            "question": "realistic follow-up interview question",
+                            "why_panel_would_ask": "why an IIM panel would ask it",
+                            "ideal_answer": "MBA-level answer structure, not fabricated personal facts",
+                            "skills_being_evaluated": ["skills"],
+                            "improvement_advice": "specific practice advice",
+                        }
+                    ]
+                },
+            }
+        )
+        data = self._chat_json(system, user, temperature=0.3)
+        items = []
+        for raw in (data or {}).get("coaching_items") or []:
+            if not isinstance(raw, dict):
+                continue
+            weakness = str(raw.get("weakness") or "").strip()
+            question = str(raw.get("question") or "").strip()
+            if not weakness or not question:
+                continue
+            items.append(
+                FollowUpCoachingItem(
+                    weakness=weakness[:260],
+                    question=self._sanitize_question(question),
+                    why_panel_would_ask=str(raw.get("why_panel_would_ask") or "")[:500],
+                    ideal_answer=str(raw.get("ideal_answer") or "")[:1400],
+                    skills_being_evaluated=self._as_string_list(raw.get("skills_being_evaluated"))[:6],
+                    improvement_advice=str(raw.get("improvement_advice") or "")[:700],
+                )
+            )
+        return items[:6] or None
+
+    def _local_coaching_item(
+        self, weakness: str, evidence: list[TranscriptEvidence]
+    ) -> FollowUpCoachingItem:
+        weakness_lower = weakness.lower()
+        related = next(
+            (
+                item
+                for item in evidence
+                if item.topic.lower() in weakness_lower or weakness_lower in item.panel_interpretation.lower()
+            ),
+            evidence[0] if evidence else None,
+        )
+        if "leadership" in weakness_lower:
+            question = "Describe a leadership situation where people disagreed with you. What decision did you make, and what measurable outcome changed?"
+            skills = ["Leadership judgment", "Conflict handling", "Outcome orientation"]
+            answer = (
+                "A strong answer would set context, name the disagreement, explain the decision criteria, "
+                "show how stakeholders were aligned, quantify the result, and end with a learning relevant "
+                "to an MBA classroom."
+            )
+        elif "business" in weakness_lower or "awareness" in weakness_lower:
+            question = "Pick one recent business issue connected to your target industry. Who gains, who loses, and what managerial decision would you recommend?"
+            skills = ["Business awareness", "Stakeholder thinking", "Managerial reasoning"]
+            answer = (
+                "A strong answer would briefly define the issue, identify stakeholders, compare trade-offs, "
+                "state a recommendation, and explain the metric that would prove whether the decision worked."
+            )
+        elif "academic" in weakness_lower or "project" in weakness_lower:
+            question = "Take one project or academic concept from your resume. What trade-off did you face, and how did you measure whether your approach worked?"
+            skills = ["Academic depth", "Problem solving", "Evidence quality"]
+            answer = (
+                "A strong answer would explain the concept in simple language, describe the alternative options, "
+                "justify the chosen approach, quantify the impact, and acknowledge one limitation."
+            )
+        elif "career" in weakness_lower or "mba" in weakness_lower:
+            question = "Why is an MBA necessary now for your target role, and what exact skill gap are you trying to close?"
+            skills = ["MBA fit", "Career clarity", "Self-awareness"]
+            answer = (
+                "A strong answer would connect past exposure, target role, skill gap, school resources, and a "
+                "credible post-MBA path without claiming that admission itself guarantees the outcome."
+            )
+        else:
+            question = "Give one specific incident that shows this weakness. What caused it, what did you change, and what evidence shows improvement?"
+            skills = ["Self-awareness", "Communication structure", "Learning agility"]
+            answer = (
+                "A strong answer would use a concrete incident, accept responsibility, identify the root cause, "
+                "describe corrective action, and provide evidence of changed behavior."
+            )
+        source = f" Panel evidence: {related.evidence}" if related else ""
+        return FollowUpCoachingItem(
+            weakness=weakness,
+            question=question,
+            why_panel_would_ask=(
+                "The panel would ask this to verify whether the weakness is a one-off gap or a pattern "
+                f"that affects MBA readiness.{source}"
+            )[:700],
+            ideal_answer=answer,
+            skills_being_evaluated=skills,
+            improvement_advice="Practice this answer with one real example, one metric, and one reflective learning.",
+        )
+
+    def _mba_readiness_assessment(
+        self, overall: float, dimensions: list[DimensionScore]
+    ) -> str:
+        weak = [item.name for item in dimensions if item.score is None or (item.score or 0) < 6.5]
+        if overall >= 7.4:
+            base = "The candidate shows credible MBA interview readiness with evidence in several evaluated areas."
+        elif overall >= 6.0:
+            base = "The candidate shows partial MBA readiness but needs sharper evidence and more consistent depth."
+        else:
+            base = "The candidate is not yet demonstrating enough MBA interview readiness from the transcript evidence."
+        if weak:
+            return f"{base} Priority gaps: {', '.join(weak[:4])}."
+        return base
+
+    def _dimension_score_map(self, report: InterviewReport) -> dict[str, float | None]:
+        return {item.name: item.score for item in report.dimensions}
 
     def _profile_payload(self, profile: CandidateProfile) -> dict[str, Any]:
         return profile.model_dump(exclude={"resume_text"}, mode="json") | {
@@ -720,6 +1366,8 @@ class InterviewIntelligence:
     def _memory_payload(self, memory: InterviewMemory) -> dict[str, Any]:
         return {
             "topics_covered": memory.topics_covered,
+            "topic_states": [state.model_dump(mode="json") for state in memory.topic_states],
+            "asked_questions": memory.asked_questions[-20:],
             "candidate_claims": [claim.model_dump(mode="json") for claim in memory.candidate_claims],
             "weaknesses": memory.weaknesses,
             "strengths": memory.strengths,
@@ -791,26 +1439,429 @@ class InterviewIntelligence:
         return ""
 
     def _open_topics(self, memory: InterviewMemory) -> list[str]:
+        self._ensure_topic_states(memory)
         desired = []
         if memory.candidate.education:
-            desired.append("education")
+            desired.append("academics")
         if memory.candidate.projects:
             desired.append("projects")
         if memory.candidate.internships:
             desired.append("internships")
-        if memory.candidate.skills:
-            desired.append("skills")
         if memory.candidate.career_goals or memory.candidate.goals:
-            desired.append("why mba")
-        desired.extend(["leadership", "business impact"])
-        return [topic for topic in self._dedupe(desired) if topic not in memory.topics_covered]
+            desired.extend(["career goals", "MBA motivation"])
+        desired.extend(["leadership", "current affairs", "strengths", "weaknesses"])
+        ranked = []
+        for topic in self._dedupe([self._canonical_topic(item) for item in desired]):
+            state = self._topic_state(memory, topic)
+            if state.status in {TopicStatus.closed, TopicStatus.sufficiently_tested}:
+                continue
+            if len(state.questions_asked) >= 2:
+                continue
+            ranked.append(topic)
+        return sorted(ranked, key=lambda item: (self._topic_state(memory, item).questions_asked, self._topic_state(memory, item).depth_level))
+
+    def _ensure_topic_states(self, memory: InterviewMemory) -> None:
+        existing = {self._canonical_topic(item.topic_name): item for item in memory.topic_states}
+        normalized_states = []
+        for topic in TOPIC_COVERAGE:
+            state = existing.get(topic)
+            if state is None:
+                state = TopicState(topic_name=topic)
+            state.topic_name = topic
+            normalized_states.append(state)
+        for state in memory.topic_states:
+            topic = self._canonical_topic(state.topic_name)
+            if topic not in TOPIC_COVERAGE and topic:
+                state.topic_name = topic
+                normalized_states.append(state)
+        memory.topic_states = normalized_states
+
+    def _canonical_topic(self, topic: str) -> str:
+        normalized = re.sub(r"[^a-z0-9]+", " ", str(topic or "").lower()).strip()
+        if not normalized:
+            return "projects"
+        return TOPIC_ALIASES.get(normalized, normalized if normalized in TOPIC_COVERAGE else "projects")
+
+    def _topic_state(self, memory: InterviewMemory, topic: str) -> TopicState:
+        canonical = self._canonical_topic(topic)
+        self._ensure_topic_states(memory) if not memory.topic_states else None
+        for state in memory.topic_states:
+            if self._canonical_topic(state.topic_name) == canonical:
+                return state
+        state = TopicState(topic_name=canonical)
+        memory.topic_states.append(state)
+        return state
+
+    def _next_viable_follow_up(self, memory: InterviewMemory) -> FollowUpOpportunity | None:
+        while memory.unanswered_follow_up_opportunities:
+            opportunity = memory.unanswered_follow_up_opportunities.pop(0)
+            opportunity.topic = self._canonical_topic(opportunity.topic)
+            state = self._topic_state(memory, opportunity.topic)
+            if state.status in {TopicStatus.closed, TopicStatus.sufficiently_tested}:
+                continue
+            if len(state.questions_asked) >= 2 and not memory.contradictions:
+                continue
+            return opportunity
+        return None
+
+    def _least_tested_reopenable_topic(self, memory: InterviewMemory) -> str:
+        candidates = []
+        for topic in TOPIC_COVERAGE:
+            state = self._topic_state(memory, topic)
+            if state.status == TopicStatus.closed:
+                continue
+            if len(state.questions_asked) >= 3:
+                continue
+            candidates.append(topic)
+        if not candidates:
+            return ""
+        return min(candidates, key=lambda item: (len(self._topic_state(memory, item).questions_asked), self._topic_state(memory, item).depth_level))
+
+    def _depth_focus(self, topic: str, depth: int) -> str:
+        ladder = TOPIC_DEPTH_LADDERS.get(self._canonical_topic(topic), TOPIC_DEPTH_LADDERS["projects"])
+        return ladder[max(0, min(depth, len(ladder)) - 1)]
+
+    def _last_interviewer_topic(self, memory: InterviewMemory) -> str:
+        last_question = ""
+        for turn in reversed(memory.transcript):
+            if turn.speaker == TurnSpeaker.interviewer:
+                last_question = turn.text
+                break
+        if not last_question:
+            return ""
+        for state in memory.topic_states:
+            if any(self._semantically_similar(last_question, question) for question in state.questions_asked):
+                return state.topic_name
+        return ""
+
+    def _topics_from_answer(self, latest_answer: str) -> list[str]:
+        lower = latest_answer.lower()
+        matches = []
+        keyword_map = {
+            "academics": ["college", "cgpa", "degree", "semester", "academic", "subject"],
+            "projects": ["project", "built", "developed", "metric", "customer", "revenue", "cost", "profit"],
+            "internships": ["intern", "trainee", "work", "company", "manager"],
+            "leadership": ["led", "lead", "team", "organized", "managed", "conflict"],
+            "career goals": ["career", "role", "industry", "consulting", "product", "strategy"],
+            "MBA motivation": ["mba", "business school", "management"],
+            "current affairs": ["economy", "policy", "market", "inflation", "budget", "geopolitics"],
+            "strengths": ["strength", "strong", "good at"],
+            "weaknesses": ["weakness", "improve", "struggle", "failed"],
+        }
+        for topic, keywords in keyword_map.items():
+            if any(keyword in lower for keyword in keywords):
+                matches.append(topic)
+        return matches
+
+    def _update_topic_evidence(
+        self, memory: InterviewMemory, latest_answer: str, topics: list[str]
+    ) -> None:
+        evidence = self._summarize_evidence(latest_answer)
+        if not evidence:
+            return
+        topics = topics or ([self._last_interviewer_topic(memory)] if self._last_interviewer_topic(memory) else [])
+        for topic in self._dedupe([self._canonical_topic(item) for item in topics]):
+            state = self._topic_state(memory, topic)
+            if evidence not in state.evidence_collected:
+                state.evidence_collected.append(evidence[:220])
+            if topic not in memory.topics_covered:
+                memory.topics_covered.append(topic)
+            self._refresh_topic_status(state)
+
+    def _summarize_evidence(self, text: str) -> str:
+        clean = self._sanitize_candidate_text(text)
+        if not clean or self._is_candidate_filler(clean):
+            return ""
+        sentences = re.split(r"(?<=[.!?])\s+", clean)
+        candidate = next((item for item in sentences if len(item.split()) >= 6), clean)
+        return candidate.strip()[:220]
+
+    def _refresh_topic_status(self, state: TopicState) -> None:
+        evidence_score = len(state.evidence_collected)
+        if state.questions_asked:
+            state.status = TopicStatus.in_progress
+        if evidence_score >= 2 and state.depth_level >= 2:
+            state.status = TopicStatus.closed
+        elif len(state.questions_asked) >= 2 or state.depth_level >= 3:
+            state.status = TopicStatus.sufficiently_tested
+
+    def _record_accepted_question(self, memory: InterviewMemory, question: str, topic: str) -> None:
+        clean_question = self._sanitize_question(question)
+        state = self._topic_state(memory, topic)
+        if clean_question not in state.questions_asked:
+            state.questions_asked.append(clean_question)
+        if clean_question not in memory.asked_questions:
+            memory.asked_questions.append(clean_question)
+        state.depth_level = min(max(state.depth_level + 1, 1), 5)
+        state.status = TopicStatus.in_progress
+        self._refresh_topic_status(state)
 
     def _last_claim(self, memory: InterviewMemory) -> str:
-        if memory.candidate_claims:
-            return memory.candidate_claims[-1].text
-        if memory.candidate.notable_resume_claims:
-            return memory.candidate.notable_resume_claims[0]
+        for claim in reversed(memory.candidate_claims):
+            if not self._is_bad_anchor(claim.text):
+                return claim.text
+        for claim in memory.candidate.notable_resume_claims:
+            if not self._is_bad_anchor(claim):
+                return claim
         return ""
+
+    def _topic_from_reason(self, reason: str) -> str:
+        lower = reason.lower()
+        for topic in [
+            "academics",
+            "education",
+            "projects",
+            "internships",
+            "skills",
+            "achievements",
+            "career goals",
+            "career_goals",
+            "why mba",
+            "mba motivation",
+            "leadership",
+            "current affairs",
+            "strengths",
+            "weaknesses",
+            "consistency",
+        ]:
+            if topic in lower:
+                return self._canonical_topic(topic)
+        return "projects"
+
+    def _anchor_for_topic(
+        self,
+        memory: InterviewMemory,
+        topic: str,
+        claim: str,
+        opening_topic: str,
+    ) -> str:
+        profile = memory.candidate
+        topic_groups = {
+            "academics": profile.education,
+            "projects": profile.projects,
+            "internships": profile.internships,
+            "skills": profile.skills,
+            "achievements": profile.achievements,
+            "leadership": profile.achievements + profile.notable_resume_claims,
+            "career goals": profile.career_goals,
+            "MBA motivation": profile.career_goals or ([profile.goals] if profile.goals else []),
+            "current affairs": profile.notable_resume_claims,
+            "strengths": profile.achievements + profile.notable_resume_claims,
+            "weaknesses": profile.notable_resume_claims,
+        }
+        candidates = topic_groups.get(topic, [])
+        anchor = self._first_clean_available(candidates, [opening_topic], profile.notable_resume_claims, [claim])
+        return self._safe_question_anchor(anchor or "your resume and interview answers")
+
+    def _first_clean_available(self, *groups: list[str] | tuple[str, ...] | str) -> str:
+        for group in groups:
+            if isinstance(group, str):
+                if group.strip() and not self._is_bad_anchor(group):
+                    return group.strip()
+                continue
+            for item in group:
+                if item and item.strip() and not self._is_bad_anchor(item):
+                    return item.strip()
+        return ""
+
+    def _finalize_question(
+        self,
+        memory: InterviewMemory,
+        question: str,
+        interviewer_id: InterviewerId,
+        topic: str,
+        latest_answer: str = "",
+    ) -> str:
+        topic = self._canonical_topic(topic)
+        question = self._sanitize_question(question)
+        if not self._question_is_acceptable(memory, question, latest_answer):
+            question = self._alternative_question(memory, interviewer_id, topic, latest_answer)
+        if not self._question_is_acceptable(memory, question, latest_answer):
+            alternate_topic = self._first_different_open_topic(memory, topic)
+            question = self._alternative_question(memory, TOPIC_TO_INTERVIEWER.get(alternate_topic, interviewer_id), alternate_topic, latest_answer)
+            topic = alternate_topic
+        self._record_accepted_question(memory, question, topic)
+        return question
+
+    def _question_is_acceptable(self, memory: InterviewMemory, question: str, latest_answer: str = "") -> bool:
+        if not question or self._is_bad_anchor(question) or self._is_candidate_filler(question):
+            return False
+        lower = question.lower()
+        if "tell me more" in lower or "what to answer" in lower:
+            return False
+        if latest_answer and self._contains_verbatim_candidate_speech(question, latest_answer):
+            return False
+        prior_questions = memory.asked_questions + [
+            turn.text for turn in memory.transcript if turn.speaker == TurnSpeaker.interviewer
+        ]
+        return not any(self._semantically_similar(question, prior) for prior in prior_questions)
+
+    def _alternative_question(
+        self,
+        memory: InterviewMemory,
+        interviewer_id: InterviewerId,
+        topic: str,
+        latest_answer: str = "",
+    ) -> str:
+        topic = self._canonical_topic(topic)
+        state = self._topic_state(memory, topic)
+        next_depth = min(state.depth_level + 1, 5)
+        depth_focus = self._depth_focus(topic, next_depth)
+        if memory.contradictions and interviewer_id == InterviewerId.pressure:
+            return (
+                "Your earlier answers appear inconsistent. Which claim should the panel trust, "
+                "and what concrete evidence supports that version?"
+            )
+        if topic == "projects":
+            options = [
+                f"At the {depth_focus} level of your project, which decision had the biggest trade-off, and how did you measure the result?",
+                "What metric improved because of the project, and what would you change if you rebuilt it today?",
+                "Why did you choose that architecture or approach over the next best alternative?",
+            ]
+        elif topic == "academics":
+            options = [
+                f"At the {depth_focus} level, explain one academic concept from your background and where it breaks down in practice.",
+                "Which subject from your academics would you defend most confidently, and how does it apply to a business problem?",
+                "What assumption in that concept would you challenge if the context changed?",
+            ]
+        elif topic == "internships":
+            options = [
+                f"At the {depth_focus} level of your internship, what did you personally own and how was success measured?",
+                "Which stakeholder constraint shaped your internship work, and what trade-off did it force?",
+                "What would your manager say was your most measurable contribution?",
+            ]
+        elif topic == "leadership":
+            options = [
+                "Describe one leadership situation where people disagreed with you. What decision did you make and what changed afterwards?",
+                "How did you measure whether your leadership actually improved the team outcome?",
+                "What leadership trade-off would you handle differently today?",
+            ]
+        elif topic == "career goals":
+            options = [
+                "What specific post-MBA role are you targeting, and what evidence from your past makes that path credible?",
+                "Which industry problem do you want to work on, and why are you suited to it?",
+                "What is your fallback path if your preferred post-MBA role does not materialize?",
+            ]
+        elif topic == "MBA motivation":
+            options = [
+                "Why is an MBA necessary now rather than learning the same skills on the job?",
+                "Which exact skill gap is the MBA meant to close, and how will you test that during the program?",
+                "What would make this MBA decision a poor investment for you?",
+            ]
+        elif topic == "current affairs":
+            options = [
+                "Choose one current business or economic issue. Who gains, who loses, and what managerial decision would you make?",
+                "What current policy or market shift could affect your target industry, and how?",
+                "Where do you disagree with the popular view on a recent business issue?",
+            ]
+        elif topic == "strengths":
+            options = [
+                "Name one strength with a specific incident, the outcome it created, and where that strength can become a liability.",
+                "How would a teammate prove that this strength is real rather than self-perception?",
+                "Which strength will matter most in an MBA classroom, and why?",
+            ]
+        else:
+            options = [
+                "Name one real weakness from a recent incident, its root cause, and the evidence that you are improving it.",
+                "What feedback have you repeatedly received, and what have you changed because of it?",
+                "Where could this weakness hurt you in an MBA classroom or placement process?",
+            ]
+        for option in options:
+            if self._question_is_acceptable(memory, option, latest_answer):
+                return option
+        return options[-1]
+
+    def _first_different_open_topic(self, memory: InterviewMemory, current_topic: str) -> str:
+        current_topic = self._canonical_topic(current_topic)
+        for topic in self._open_topics(memory):
+            if topic != current_topic:
+                return topic
+        for topic in TOPIC_COVERAGE:
+            if topic != current_topic and self._topic_state(memory, topic).status != TopicStatus.closed:
+                return topic
+        return current_topic
+
+    def _semantically_similar(self, first: str, second: str) -> bool:
+        first_norm = self._normalize_for_compare(first)
+        second_norm = self._normalize_for_compare(second)
+        if not first_norm or not second_norm:
+            return False
+        if first_norm == second_norm:
+            return True
+        first_tokens = set(first_norm.split())
+        second_tokens = set(second_norm.split())
+        overlap = len(first_tokens & second_tokens) / max(1, len(first_tokens | second_tokens))
+        sequence = SequenceMatcher(None, first_norm, second_norm).ratio()
+        return overlap >= 0.62 or sequence >= 0.82
+
+    def _normalize_for_compare(self, value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+    def _is_bad_anchor(self, value: str) -> bool:
+        lower = value.lower()
+        bad_fragments = [
+            "uploaded resume:",
+            "resume.pdf",
+            "pdf extraction is handled",
+            "backend integration phase",
+            "i don't know what to answer",
+            "i dont know what to answer",
+            "what should i answer",
+            "what to answer",
+            "umm",
+            "uhh",
+        ]
+        return any(fragment in lower for fragment in bad_fragments)
+
+    def _sanitize_candidate_text(self, value: str) -> str:
+        clean = re.sub(r"\s+", " ", str(value or "")).strip()
+        filler_patterns = [
+            r"(?i)\bi don'?t know what to answer\b",
+            r"(?i)\bi don'?t know\b",
+            r"(?i)\bwhat should i answer\b",
+            r"(?i)\bwhat to answer\b",
+            r"(?i)\bumm+\b",
+            r"(?i)\buhh+\b",
+        ]
+        for pattern in filler_patterns:
+            clean = re.sub(pattern, "", clean).strip()
+        clean = re.sub(r"\s+", " ", clean).strip(" ,.-")
+        return clean
+
+    def _sanitize_question(self, value: str) -> str:
+        clean = self._sanitize_candidate_text(value)
+        clean = re.sub(r"\s+", " ", clean).strip()
+        clean = clean.strip('"').strip("'").strip()
+        if clean and not clean.endswith("?"):
+            clean = clean.rstrip(".") + "?"
+        return clean[:700]
+
+    def _is_candidate_filler(self, value: str) -> bool:
+        normalized = self._normalize_for_compare(value)
+        if not normalized:
+            return True
+        filler = {
+            "i dont know what to answer",
+            "i dont know",
+            "what should i answer",
+            "what to answer",
+            "no idea",
+            "nothing",
+        }
+        return normalized in filler or len(normalized.split()) <= 2
+
+    def _contains_verbatim_candidate_speech(self, question: str, latest_answer: str) -> bool:
+        answer = self._sanitize_candidate_text(latest_answer)
+        if len(answer.split()) < 5:
+            return False
+        question_norm = self._normalize_for_compare(question)
+        words = self._normalize_for_compare(answer).split()
+        for size in range(min(10, len(words)), 4, -1):
+            for index in range(0, len(words) - size + 1):
+                phrase = " ".join(words[index : index + size])
+                if phrase and phrase in question_norm:
+                    return True
+        return False
 
     def _first_available(self, *groups: list[str] | tuple[str, ...] | str) -> str:
         for group in groups:
@@ -826,6 +1877,13 @@ class InterviewIntelligence:
     def _clean_anchor(self, value: str) -> str:
         return value.strip().rstrip(".")
 
+    def _safe_question_anchor(self, value: str) -> str:
+        clean = self._sanitize_candidate_text(value)
+        if self._is_bad_anchor(clean) or self._is_candidate_filler(clean):
+            return "your resume and interview answers"
+        words = clean.split()
+        return " ".join(words[:24]).strip().rstrip(".") or "your resume and interview answers"
+
     def _role_for(self, interviewer_id: InterviewerId) -> str:
         if interviewer_id == InterviewerId.academic:
             return "Academic Interviewer: academics, projects, internships, conceptual depth."
@@ -838,6 +1896,50 @@ class InterviewIntelligence:
             return InterviewerId(str(value).lower())
         except ValueError:
             return InterviewerId.pressure
+
+    def _parse_transcript_evidence(self, value: Any) -> list[TranscriptEvidence]:
+        items = []
+        for item in value or []:
+            if not isinstance(item, dict):
+                continue
+            evidence = self._sanitize_candidate_text(str(item.get("evidence") or ""))
+            if not evidence:
+                continue
+            items.append(
+                TranscriptEvidence(
+                    topic=self._canonical_topic(str(item.get("topic") or "projects")),
+                    evidence=evidence[:240],
+                    panel_interpretation=str(item.get("panel_interpretation") or "")[:240]
+                    or "Panel noted this as transcript-backed evidence.",
+                )
+            )
+        return items[:8]
+
+    def _parse_benchmarks(self, value: Any) -> list[BenchmarkCategory]:
+        items = []
+        allowed = {
+            "Typical IIM Convert Candidate",
+            "Strong IIM ABC Candidate",
+            "Average CAT Aspirant",
+        }
+        for item in value or []:
+            if not isinstance(item, dict):
+                continue
+            category = str(item.get("category") or "")
+            if category not in allowed:
+                continue
+            items.append(
+                BenchmarkCategory(
+                    category=category,  # type: ignore[arg-type]
+                    communication=str(item.get("communication") or "Insufficient evidence"),
+                    leadership=str(item.get("leadership") or "Insufficient evidence"),
+                    business_awareness=str(item.get("business_awareness") or "Insufficient evidence"),
+                    academic_depth=str(item.get("academic_depth") or "Insufficient evidence"),
+                    mba_fit=str(item.get("mba_fit") or "Insufficient evidence"),
+                    notes=str(item.get("notes") or "Preparedness benchmark only."),
+                )
+            )
+        return items[:3]
 
     def _as_string_list(self, value: Any) -> list[str]:
         if value is None:
@@ -874,6 +1976,10 @@ class InterviewIntelligence:
                 return turn.strip()[:240]
         return "Insufficient transcript evidence."
 
+    def _contains_any(self, text: str, keywords: list[str]) -> bool:
+        lower = text.lower()
+        return any(keyword in lower for keyword in keywords)
+
     def _dimension(
         self,
         name: str,
@@ -893,10 +1999,20 @@ class InterviewIntelligence:
         )
 
     def _verdict(self, overall: float) -> str:
-        if overall >= 8.2:
-            return "Strong Hire"
-        if overall >= 6.8:
-            return "Lean Hire"
-        if overall >= 4.5:
-            return "Lean Reject"
-        return "Strong Reject"
+        if overall >= 7.4:
+            return "Likely Convert"
+        if overall >= 6.0:
+            return "Borderline"
+        return "Needs Improvement"
+
+    def _normalize_verdict(self, verdict: str) -> str:
+        normalized = verdict.strip()
+        if normalized in {"Likely Convert", "Borderline", "Needs Improvement"}:
+            return normalized
+        legacy = {
+            "Strong Hire": "Likely Convert",
+            "Lean Hire": "Borderline",
+            "Lean Reject": "Needs Improvement",
+            "Strong Reject": "Needs Improvement",
+        }
+        return legacy.get(normalized, "Needs Improvement")
