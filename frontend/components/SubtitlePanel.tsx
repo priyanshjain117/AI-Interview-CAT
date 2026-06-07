@@ -18,7 +18,7 @@ export function SubtitlePanel({
         </span>
       </div>
       <p className="min-h-20 text-xl font-medium leading-9 text-slate-950">
-        {text || "Start the interview to hear the panel's first question."}
+        {text}
       </p>
     </section>
   );
