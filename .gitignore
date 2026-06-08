@@ -20,6 +20,8 @@ lib64/
 frontend/lib/*
 !frontend/lib/api.ts
 !frontend/lib/types.ts
+!frontend/lib/supabase.ts
+!frontend/lib/speech-recognition.d.ts
 parts/
 sdist/
 var/
