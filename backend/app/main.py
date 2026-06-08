@@ -62,7 +62,37 @@ app.add_middleware(
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "supabase": "configured" if repository.is_configured else "missing"}
+    groq_status = "configured" if os.getenv("GROQ_API_KEY") else "missing"
+    return {
+        "status": "ok",
+        "supabase": "configured" if repository.is_configured else "missing",
+        "groq": groq_status,
+        "cors_origins": os.getenv("ALLOWED_ORIGINS", "localhost-only"),
+    }
+
+
+@app.get("/health/deep")
+def health_deep() -> dict[str, object]:
+    """Deep health check: verifies live Supabase DB connectivity and Groq key presence."""
+    results: dict[str, object] = {"status": "ok"}
+
+    # Test Supabase DB round-trip
+    try:
+        client = repository.require()
+        client.table("users").select("id").limit(1).execute()
+        results["supabase_db"] = "connected"
+    except Exception as exc:
+        results["supabase_db"] = f"error: {str(exc)[:120]}"
+        results["status"] = "degraded"
+
+    # Verify Groq key is present (don't make a live API call to avoid charges)
+    results["groq_api_key"] = "set" if os.getenv("GROQ_API_KEY") else "missing"
+    if not os.getenv("GROQ_API_KEY"):
+        results["status"] = "degraded"
+
+    results["allowed_origins"] = os.getenv("ALLOWED_ORIGINS", "localhost-only (set ALLOWED_ORIGINS in production)")
+    return results
+
 
 
 def current_user(
