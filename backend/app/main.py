@@ -1,4 +1,5 @@
 from pathlib import Path
+import asyncio
 import logging
 import os
 import textwrap
@@ -54,7 +55,7 @@ orchestrator = InterviewOrchestrator(voice_service=voice_service, repository=rep
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Validate Supabase connectivity at startup so failures are visible in Render logs."""
+    """Validate Supabase connectivity at startup; clean up audio on shutdown."""
     if repository.is_configured:
         try:
             client = repository.require()
@@ -70,6 +71,11 @@ async def lifespan(app: FastAPI):
             "SUPABASE_SERVICE_ROLE_KEY in Render environment variables."
         )
     yield  # application runs here
+    # Shutdown: remove all generated audio files so the ephemeral Render
+    # filesystem doesn't accumulate WAV files across graceful restarts.
+    n = voice_service.cleanup_all_audio()
+    if n:
+        logger.info("\U0001f9f9 Cleaned up %d audio file(s) on shutdown.", n)
 
 
 app = FastAPI(title="PANELIQ API", version="0.1.0", lifespan=lifespan)
@@ -142,9 +148,10 @@ def get_interviewers():
 
 
 @app.get("/me", response_model=UserProfileResponse)
-def get_me(user: AuthenticatedUser = Depends(current_user)) -> UserProfileResponse:
-    resume = repository.get_active_resume(user.id)
-    _, profile = repository.latest_candidate_profile(user.id)
+async def get_me(user: AuthenticatedUser = Depends(current_user)) -> UserProfileResponse:
+    loop = asyncio.get_running_loop()
+    resume = await loop.run_in_executor(None, repository.get_active_resume, user.id)
+    _, profile = await loop.run_in_executor(None, repository.latest_candidate_profile, user.id)
     return UserProfileResponse(
         user=user,
         profile=profile.model_dump(mode="json") if profile else None,
@@ -153,8 +160,9 @@ def get_me(user: AuthenticatedUser = Depends(current_user)) -> UserProfileRespon
 
 
 @app.get("/resume", response_model=ResumeRecord | None)
-def get_resume(user: AuthenticatedUser = Depends(current_user)) -> ResumeRecord | None:
-    return repository.get_active_resume(user.id)
+async def get_resume(user: AuthenticatedUser = Depends(current_user)) -> ResumeRecord | None:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, repository.get_active_resume, user.id)
 
 
 @app.post("/resume/upload", response_model=ResumeUploadResponse)
@@ -201,8 +209,10 @@ async def upload_resume(
 
 
 @app.delete("/resume", response_model=ResumeDeleteResponse)
-def delete_resume(user: AuthenticatedUser = Depends(current_user)) -> ResumeDeleteResponse:
-    return ResumeDeleteResponse(deleted=repository.delete_active_resume(user.id))
+async def delete_resume(user: AuthenticatedUser = Depends(current_user)) -> ResumeDeleteResponse:
+    loop = asyncio.get_running_loop()
+    deleted = await loop.run_in_executor(None, repository.delete_active_resume, user.id)
+    return ResumeDeleteResponse(deleted=deleted)
 
 
 @app.post("/speech/transcribe", response_model=TranscriptionResponse)
@@ -219,64 +229,72 @@ async def transcribe_answer(file: UploadFile = File(...)) -> TranscriptionRespon
 
 
 @app.post("/sessions", response_model=SessionResponse)
-def create_session(
+async def create_session(
     request: CreateSessionRequest,
     user: AuthenticatedUser = Depends(current_user),
 ) -> SessionResponse:
+    loop = asyncio.get_running_loop()
     try:
-        return orchestrator.create_session(user.id, request)
+        return await loop.run_in_executor(None, orchestrator.create_session, user.id, request)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.post("/sessions/{session_id}/start", response_model=InterviewTurnResponse)
-def start_session(
+async def start_session(
     session_id: str,
     user: AuthenticatedUser = Depends(current_user),
 ) -> InterviewTurnResponse:
+    loop = asyncio.get_running_loop()
     try:
-        return orchestrator.start_session(user.id, session_id)
+        return await loop.run_in_executor(None, orchestrator.start_session, user.id, session_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Session not found") from None
 
 
 @app.post("/sessions/{session_id}/turn", response_model=InterviewTurnResponse)
-def add_turn(
+async def add_turn(
     session_id: str,
     request: CandidateTurnRequest,
     user: AuthenticatedUser = Depends(current_user),
 ) -> InterviewTurnResponse:
+    loop = asyncio.get_running_loop()
     try:
-        return orchestrator.add_candidate_turn(user.id, session_id, request)
+        return await loop.run_in_executor(
+            None, orchestrator.add_candidate_turn, user.id, session_id, request
+        )
     except KeyError:
         raise HTTPException(status_code=404, detail="Session not found") from None
 
 
 @app.get("/sessions/{session_id}/report", response_model=InterviewReport)
-def get_report(
+async def get_report(
     session_id: str,
     user: AuthenticatedUser = Depends(current_user),
 ) -> InterviewReport:
-    stored_report = repository.get_report(user.id, session_id)
+    loop = asyncio.get_running_loop()
+    stored_report = await loop.run_in_executor(None, repository.get_report, user.id, session_id)
     if stored_report:
         return stored_report
     try:
-        return orchestrator.generate_report(user.id, session_id)
+        return await loop.run_in_executor(None, orchestrator.generate_report, user.id, session_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Session not found") from None
 
 
 @app.get("/sessions/{session_id}/report.pdf")
-def get_report_pdf(
+async def get_report_pdf(
     session_id: str,
     user: AuthenticatedUser = Depends(current_user),
 ) -> Response:
+    loop = asyncio.get_running_loop()
     try:
-        report = repository.get_report(user.id, session_id) or orchestrator.generate_report(user.id, session_id)
+        report = await loop.run_in_executor(
+            None, repository.get_report, user.id, session_id
+        ) or await loop.run_in_executor(None, orchestrator.generate_report, user.id, session_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Session not found") from None
-
-    pdf_bytes = _render_report_pdf(report)
+    pdf_bytes = await loop.run_in_executor(None, _render_report_pdf, report)
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
@@ -285,12 +303,13 @@ def get_report_pdf(
 
 
 @app.post("/sessions/{session_id}/end", response_model=EndSessionResponse)
-def end_session(
+async def end_session(
     session_id: str,
     user: AuthenticatedUser = Depends(current_user),
 ) -> EndSessionResponse:
+    loop = asyncio.get_running_loop()
     try:
-        report = orchestrator.end_session(user.id, session_id)
+        report = await loop.run_in_executor(None, orchestrator.end_session, user.id, session_id)
         return EndSessionResponse(
             session_id=session_id,
             status=InterviewStatus.completed,
@@ -301,37 +320,43 @@ def end_session(
 
 
 @app.delete("/sessions/{session_id}")
-def delete_session(
+async def delete_session(
     session_id: str,
     user: AuthenticatedUser = Depends(current_user),
 ) -> dict:
-    deleted = repository.delete_incomplete_session(user.id, session_id)
+    loop = asyncio.get_running_loop()
+    deleted = await loop.run_in_executor(
+        None, repository.delete_incomplete_session, user.id, session_id
+    )
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found or already completed")
     return {"deleted": True, "session_id": session_id}
 
 
 @app.get("/history", response_model=list[InterviewHistoryItem])
-def get_history(user: AuthenticatedUser = Depends(current_user)) -> list[InterviewHistoryItem]:
-    return repository.history(user.id)
+async def get_history(user: AuthenticatedUser = Depends(current_user)) -> list[InterviewHistoryItem]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, repository.history, user.id)
 
 
 @app.get("/progress", response_model=ProgressDashboardResponse)
-def get_progress(user: AuthenticatedUser = Depends(current_user)) -> ProgressDashboardResponse:
-    return repository.progress_dashboard(user.id)
+async def get_progress(user: AuthenticatedUser = Depends(current_user)) -> ProgressDashboardResponse:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, repository.progress_dashboard, user.id)
 
 
 @app.get("/reports/compare", response_model=ReportComparisonResponse)
-def compare_reports(
+async def compare_reports(
     left_session_id: str,
     right_session_id: str,
     user: AuthenticatedUser = Depends(current_user),
 ) -> ReportComparisonResponse:
-    left = repository.get_report(user.id, left_session_id)
-    right = repository.get_report(user.id, right_session_id)
+    loop = asyncio.get_running_loop()
+    left = await loop.run_in_executor(None, repository.get_report, user.id, left_session_id)
+    right = await loop.run_in_executor(None, repository.get_report, user.id, right_session_id)
     if not left or not right:
         raise HTTPException(status_code=404, detail="Report not found")
-    comparison = orchestrator.compare_reports(left, right)
+    comparison = await loop.run_in_executor(None, orchestrator.compare_reports, left, right)
     return ReportComparisonResponse(left=left, right=right, **comparison)
 
 

@@ -40,21 +40,11 @@ except ImportError:  # pragma: no cover
     create_client = None  # type: ignore[assignment]
 
 
-def _make_http_client() -> httpx.Client:
-    """Return an httpx.Client with HTTP/2 disabled.
-
-    Rationale: Render's edge negotiates HTTP/2 and sends GOAWAY / RST_STREAM
-    frames when idle streams expire. httpx then tries to reuse the dead
-    connection, causing RemoteProtocolError: ConnectionTerminated error_code:1.
-    Forcing HTTP/1.1 eliminates the entire H2 code-path and is more than fast
-    enough for PostgREST query volumes.
-    """
-    return httpx.Client(http2=False)
-
-
 # Retry decorator for transient Supabase transport errors.
 # Retries on httpx protocol/connection errors only — PostgREST application
 # errors (4xx/5xx from the database) are NOT retried.
+# Defined ONCE at module level so tenacity builds the Retrying state machine
+# a single time, not on every call to _supabase_execute.
 _RETRYABLE = (
     httpx.RemoteProtocolError,
     httpx.LocalProtocolError,
@@ -63,25 +53,26 @@ _RETRYABLE = (
 )
 
 
+@retry(
+    retry=retry_if_exception_type(_RETRYABLE),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
+    before=before_log(logger, logging.WARNING),
+    reraise=True,
+)
 def _supabase_execute(query):
     """Execute a PostgREST query builder with retry on transport errors.
+
+    The @retry decorator is applied once at module import time — not rebuilt
+    on every call — to avoid creating a new tenacity Retrying state machine
+    object on each of the 28+ call sites.
 
     Usage::
         response = _supabase_execute(
             client.table("users").select("*").eq("id", uid).limit(1)
         )
     """
-    @retry(
-        retry=retry_if_exception_type(_RETRYABLE),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
-        before=before_log(logger, logging.WARNING),
-        reraise=True,
-    )
-    def _run():
-        return query.execute()
-
-    return _run()
+    return query.execute()
 
 
 class SupabaseRepository:
@@ -90,13 +81,11 @@ class SupabaseRepository:
         self.service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
         self.anon_key = os.getenv("SUPABASE_ANON_KEY") or os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY")
         self.client: Client | None = None
+        # Cached anon-key client reused across all verify_access_token calls.
+        # Creating a new client per request leaks an httpx connection pool each time.
+        self._anon_client: Client | None = None
         if create_client and self.url and self.service_key:
-            # http2=False: prevents Render GOAWAY/RST_STREAM connection-reuse crashes.
-            self.client = create_client(
-                self.url,
-                self.service_key,
-                options={"httpclient": _make_http_client()},
-            )
+            self.client = create_client(self.url, self.service_key)
 
     @property
     def is_configured(self) -> bool:
@@ -113,12 +102,11 @@ class SupabaseRepository:
     def verify_access_token(self, token: str) -> dict[str, Any]:
         if not self.url or not self.anon_key or not create_client:
             raise HTTPException(status_code=503, detail="Supabase Auth is not configured.")
-        # http2=False: same transport fix for the ephemeral auth client.
-        auth_client = create_client(
-            self.url,
-            self.anon_key,
-            options={"httpclient": _make_http_client()},
-        )
+        # Reuse the cached anon client — creating a new one per request leaks
+        # an httpx.Client connection pool (default pool_size=10 connections).
+        if self._anon_client is None:
+            self._anon_client = create_client(self.url, self.anon_key)
+        auth_client = self._anon_client
         try:
             user = auth_client.auth.get_user(token).user
         except Exception as exc:

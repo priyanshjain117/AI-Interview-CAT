@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import wave
 from pathlib import Path
 from uuid import uuid4
@@ -47,6 +48,12 @@ class VoiceService:
         if not pipeline:
             return None
 
+        # Clean up audio files older than 30 minutes before writing a new one.
+        # Each interview turn writes a new UUID.wav (~1-2 MB). Without cleanup
+        # the generated_audio/ directory fills Render's 512 MB ephemeral disk
+        # after a few dozen sessions.
+        self._cleanup_old_audio(max_age_seconds=1800)
+
         try:
             voice = self._kokoro_voice(interviewer_id)
             filename = f"{uuid4()}.wav"
@@ -63,6 +70,26 @@ class VoiceService:
             return f"/audio/{filename}"
         except Exception:
             return None
+
+    def cleanup_all_audio(self) -> int:
+        """Delete all generated audio files. Called at application shutdown."""
+        return self._cleanup_old_audio(max_age_seconds=0)
+
+    def _cleanup_old_audio(self, max_age_seconds: float) -> int:
+        """Delete WAV files older than max_age_seconds. Returns number of files deleted."""
+        cutoff = time.monotonic() - max_age_seconds
+        deleted = 0
+        try:
+            for f in self.audio_dir.glob("*.wav"):
+                try:
+                    if time.monotonic() - f.stat().st_mtime > max_age_seconds:
+                        f.unlink(missing_ok=True)
+                        deleted += 1
+                except OSError:
+                    pass  # File already gone or permission issue — skip.
+        except OSError:
+            pass
+        return deleted
 
     def _load_whisper_model(self):
         if self._whisper_model is not None:

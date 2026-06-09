@@ -171,6 +171,13 @@ QUALITY_RULES = [
     "MBA Fit Assessment",
 ]
 
+# Hard caps on unbounded InterviewMemory lists.
+# These lists are serialized to JSON on every save_memory() call — without
+# caps they grow by 2-3 items per turn and inflate the Supabase payload.
+_MAX_OBSERVATIONS = 20   # interviewer_observations per session
+_MAX_FOLLOW_UPS   = 10   # unanswered_follow_up_opportunities per session
+_MAX_CLAIMS       = 30   # candidate_claims per session
+
 
 class InterviewIntelligence:
     """Groq-backed interview intelligence with local development fallbacks."""
@@ -480,6 +487,9 @@ class InterviewIntelligence:
             )
             if observation.note not in [item.note for item in memory.interviewer_observations]:
                 memory.interviewer_observations.append(observation)
+        # Keep only the most recent observations to bound memory/JSON size.
+        if len(memory.interviewer_observations) > _MAX_OBSERVATIONS:
+            memory.interviewer_observations = memory.interviewer_observations[-_MAX_OBSERVATIONS:]
 
         for raw_claim in data.get("candidate_claims") or []:
             if isinstance(raw_claim, dict) and raw_claim.get("text"):
@@ -494,6 +504,8 @@ class InterviewIntelligence:
                 )
                 if claim.text not in memory.claims:
                     memory.candidate_claims.append(claim)
+        if len(memory.candidate_claims) > _MAX_CLAIMS:
+            memory.candidate_claims = memory.candidate_claims[-_MAX_CLAIMS:]
 
         for raw_follow_up in data.get("unanswered_follow_up_opportunities") or []:
             if not isinstance(raw_follow_up, dict):
@@ -511,6 +523,8 @@ class InterviewIntelligence:
             )
             if opportunity.reason not in [item.reason for item in memory.unanswered_follow_up_opportunities]:
                 memory.unanswered_follow_up_opportunities.append(opportunity)
+        if len(memory.unanswered_follow_up_opportunities) > _MAX_FOLLOW_UPS:
+            memory.unanswered_follow_up_opportunities = memory.unanswered_follow_up_opportunities[-_MAX_FOLLOW_UPS:]
 
     def _update_memory_locally(self, memory: InterviewMemory, latest_answer: str) -> None:
         lower = latest_answer.lower()
@@ -586,6 +600,12 @@ class InterviewIntelligence:
                     source_claim=contradiction,
                 )
             )
+
+        # Cap unbounded lists after local update.
+        if len(memory.unanswered_follow_up_opportunities) > _MAX_FOLLOW_UPS:
+            memory.unanswered_follow_up_opportunities = memory.unanswered_follow_up_opportunities[-_MAX_FOLLOW_UPS:]
+        if len(memory.candidate_claims) > _MAX_CLAIMS:
+            memory.candidate_claims = memory.candidate_claims[-_MAX_CLAIMS:]
 
     def _select_speaker_with_groq(self, memory: InterviewMemory) -> SpeakerSelection | None:
         counts = Counter(str(item.value) for item in memory.speaker_history)
