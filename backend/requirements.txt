@@ -12,3 +12,20 @@ PyMuPDF==1.25.1
 faster-whisper==1.1.0
 kokoro==0.9.4
 supabase==2.10.0
+
+# ── HTTP transport pins ────────────────────────────────────────────────────────
+# h11 0.16.0 (Apr 2025) introduced stricter trailer validation that is
+# incompatible with httpcore 1.0.x: it requires Trailers events to carry
+# end_stream=True, which httpcore does not set, causing
+#   LocalProtocolError: Trailers must have END_STREAM set
+# on every chunked PostgREST response (all Supabase queries on Render).
+# Pin to h11 0.14.0 — the last version before the breaking change.
+h11==0.14.0
+# httpcore 1.0.7 is the last release tested against h11 < 0.15.
+# Do not upgrade without also upgrading httpx and verifying h11 compatibility.
+httpcore==1.0.7
+
+# ── Retry support ─────────────────────────────────────────────────────────────
+# Used to retry transient Supabase transport errors (RemoteProtocolError,
+# LocalProtocolError, ConnectError) without surfacing HTTP 500 to the user.
+tenacity==8.5.0

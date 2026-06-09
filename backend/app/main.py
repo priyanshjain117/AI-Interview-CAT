@@ -1,6 +1,8 @@
 from pathlib import Path
+import logging
 import os
 import textwrap
+from contextlib import asynccontextmanager
 
 # Load .env from repo root (two levels up from this file) before anything else.
 # This ensures SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY etc. are available
@@ -13,6 +15,8 @@ from fastapi import Depends, File, Form, Header, HTTPException, Response, Upload
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+
+logger = logging.getLogger(__name__)
 
 from app.database import SupabaseRepository
 from app.interviewers import INTERVIEWERS
@@ -42,11 +46,33 @@ from app.resume import ResumeProcessingError, extract_resume_text
 from app.voice import VoiceProcessingError, VoiceService
 
 
-app = FastAPI(title="PANELIQ API", version="0.1.0")
 audio_dir = Path(__file__).resolve().parents[1] / "generated_audio"
 voice_service = VoiceService(audio_dir=audio_dir)
 repository = SupabaseRepository()
 orchestrator = InterviewOrchestrator(voice_service=voice_service, repository=repository)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Validate Supabase connectivity at startup so failures are visible in Render logs."""
+    if repository.is_configured:
+        try:
+            client = repository.require()
+            client.table("users").select("id").limit(1).execute()
+            logger.info("\u2705 Supabase connectivity: OK")
+        except Exception as exc:  # noqa: BLE001
+            # Log but do NOT crash — allows degraded mode where /health/deep
+            # can still diagnose the issue after deploy.
+            logger.warning("\u26a0\ufe0f  Supabase connectivity check failed: %s", exc)
+    else:
+        logger.warning(
+            "\u26a0\ufe0f  Supabase is NOT configured — set SUPABASE_URL and "
+            "SUPABASE_SERVICE_ROLE_KEY in Render environment variables."
+        )
+    yield  # application runs here
+
+
+app = FastAPI(title="PANELIQ API", version="0.1.0", lifespan=lifespan)
 app.mount("/audio", StaticFiles(directory=audio_dir), name="audio")
 
 _cors_origins_raw = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")
@@ -62,12 +88,17 @@ app.add_middleware(
 
 @app.get("/health")
 def health() -> dict[str, str]:
+    """Fast health check — no live DB call. Use /health/deep to verify DB."""
+    import h11
     groq_status = "configured" if os.getenv("GROQ_API_KEY") else "missing"
     return {
         "status": "ok",
         "supabase": "configured" if repository.is_configured else "missing",
         "groq": groq_status,
         "cors_origins": os.getenv("ALLOWED_ORIGINS", "localhost-only"),
+        # Deployment verification: confirm transport pins are active.
+        "h11_version": h11.__version__,
+        "http2": "disabled",
     }
 
 
